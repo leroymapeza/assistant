@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ziva-demo
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /api/config
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: ZIVA_DEMO
+        value: "1"

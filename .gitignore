@@ -1,0 +1,7 @@
+config.json
+.env
+ziva.db
+ziva.db-journal
+__pycache__/
+*.pyc
+.venv/
