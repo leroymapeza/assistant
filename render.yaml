@@ -11,3 +11,7 @@ services:
         sync: false
       - key: ZIVA_DEMO
         value: "1"
+      - key: ZIVA_DAILY
+        value: "45"
+      - key: ZIVA_HOURLY
+        value: "10"

@@ -568,7 +568,7 @@ def stream_reply(client, history, message):
                     if getattr(e, "code", None) == 400:
                         continue
                     break
-        if attempt == 0 and _transient(last):
+        if attempt == 0 and _transient(last) and (getattr(last, "code", None) != 429 or _retry_delay(last)):
             time.sleep(_retry_delay(last) or 2)
             continue
         break
