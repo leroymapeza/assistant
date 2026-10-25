@@ -552,8 +552,16 @@ FILES = (
     "8. When the user asks you to create, write or give them a file (or several files), output each file as its own "
     "fenced code block whose opening fence is exactly the filename, for example ```index.html or ```notes/todo.md. "
     "One file per block, complete contents, no placeholders or omissions. The app turns each block into a download "
-    "and bundles several into a zip. You can only produce text-based files (code, HTML, CSS, JSON, CSV, Markdown, text); "
-    "never say you cannot create files."
+    "and bundles several into a zip. Never say you cannot create files.\n"
+    "9. Besides text-based files (code, HTML, CSS, JSON, CSV, Markdown, text) you can create Word, PDF, Excel and PowerPoint files. "
+    "Use a fence named with the right extension (report.docx, report.pdf, data.xlsx, deck.pptx) and write the content as Markdown; "
+    "the app converts it to the real file. Never write the Markdown for these outside the fence, and never claim you cannot make them.\n"
+    "- .docx and .pdf: Markdown with # headings (a single # is the document title), paragraphs, **bold**, *italic*, [links](url), "
+    "bullet lists using a leading dash, 1. numbered lists, | pipe | tables with a header row, and --- rules. Use ~~~ fences for code blocks inside these files, never backticks.\n"
+    "- .xlsx: each sheet starts with a # Sheet name heading followed by a Markdown table or CSV. The first row is the header. "
+    "Put numbers in plain form (1200, 12.5%, $1,200.50). Values starting with = are formulas such as =SUM(B2:B9).\n"
+    "- .pptx: each # or ## heading is one slide. A first # slide followed by at least one more slide becomes the title slide, with plain lines under it as the subtitle. "
+    "Use short - bullets (at most 6 per slide, indent two spaces for sub-points), tables if useful, and lines starting with > for speaker notes.\n"
 )
 RULES = STYLE + GROUND + FILES
 RAG_RULES = STYLE + RAG + FILES
@@ -983,6 +991,598 @@ async def chat_endpoint(req: ChatRequest, request: Request):
 
     headers = {"X-Conversation": str(conv), "X-User-Msg": str(user_id), "X-Asst-Msg": str(aid)}
     return StreamingResponse(body(), media_type="text/plain; charset=utf-8", headers=headers)
+
+
+EXPORT_TYPES = {
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "pdf": "application/pdf",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+EXPORT_MAX = 200_000
+_export_slots = threading.BoundedSemaphore(2)
+_INLINE = re.compile(r"(\*\*[^*]+\*\*|__[^_]+__|\*[^*\s][^*]*\*|`[^`]+`|\[[^\]]+\]\(https?://[^\s)]+\))")
+_HR = re.compile(r"(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,}")
+_SEP = re.compile(r":?-+:?")
+
+
+def _runs(text):
+    out = []
+    for part in _INLINE.split(text):
+        if not part:
+            continue
+        if len(part) > 4 and part[:2] in ("**", "__") and part[-2:] == part[:2]:
+            out.append((part[2:-2], "b", None))
+        elif len(part) > 2 and part[0] == "*" and part[-1] == "*":
+            out.append((part[1:-1], "i", None))
+        elif len(part) > 2 and part[0] == "`" and part[-1] == "`":
+            out.append((part[1:-1], "c", None))
+        elif part[0] == "[" and "](" in part and part.endswith(")"):
+            label, url = part[1:-1].split("](", 1)
+            out.append((label, "l", url))
+        else:
+            out.append((part, "", None))
+    return out
+
+
+def _plain(text):
+    return "".join(t for t, _, _ in _runs(text))
+
+
+def _cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _blocks(md):
+    out, para, lines, i = [], [], md.replace("\r", "").replace("\t", "  ").split("\n"), 0
+
+    def flush():
+        if para:
+            out.append(("p", " ".join(para)))
+            para.clear()
+
+    while i < len(lines):
+        line = lines[i]
+        s = line.strip()
+        fence = re.match(r"^(```|~~~)", s)
+        if fence:
+            flush()
+            i += 1
+            code = []
+            while i < len(lines) and not lines[i].strip().startswith(fence.group(1)):
+                code.append(lines[i])
+                i += 1
+            out.append(("code", "\n".join(code)))
+            i += 1
+            continue
+        if not s:
+            flush()
+            i += 1
+            continue
+        h = re.match(r"^(#{1,6})\s+(.*?)\s*#*$", s)
+        if h:
+            flush()
+            out.append(("h", len(h.group(1)), h.group(2)))
+            i += 1
+            continue
+        if _HR.fullmatch(s):
+            flush()
+            out.append(("hr",))
+            i += 1
+            continue
+        if s.startswith("|"):
+            flush()
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = _cells(lines[i])
+                if not all(_SEP.fullmatch(c) for c in cells if c) or not any(cells):
+                    rows.append(cells)
+                i += 1
+            width = max((len(r) for r in rows), default=0)
+            out.append(("table", [r + [""] * (width - len(r)) for r in rows]))
+            continue
+        li = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", line)
+        if li:
+            flush()
+            out.append(("li", min(len(li.group(1)) // 2, 3), li.group(2)[0].isdigit(), li.group(3).strip()))
+            i += 1
+            continue
+        if s.startswith(">"):
+            flush()
+            out.append(("quote", s.lstrip("> ").strip()))
+            i += 1
+            continue
+        para.append(s)
+        i += 1
+    flush()
+    return out
+
+
+def _docx(md):
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt
+
+    blocks = _blocks(md)
+    h1 = [b for b in blocks if b[0] == "h" and b[1] == 1]
+    titled = bool(blocks) and blocks[0][0] == "h" and blocks[0][1] == 1 and len(h1) == 1
+    doc = Document()
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(11)
+
+    def shade(el, fill):
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:fill"), fill)
+        el.append(shd)
+
+    def link(par, text, url):
+        rid = par.part.relate_to(url, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
+        h = OxmlElement("w:hyperlink")
+        h.set(qn("r:id"), rid)
+        r, pr, col, ul, t = (OxmlElement(x) for x in ("w:r", "w:rPr", "w:color", "w:u", "w:t"))
+        col.set(qn("w:val"), "0563C1")
+        ul.set(qn("w:val"), "single")
+        pr.append(col)
+        pr.append(ul)
+        r.append(pr)
+        t.text = text
+        t.set(qn("xml:space"), "preserve")
+        r.append(t)
+        h.append(r)
+        par._p.append(h)
+
+    def fill(par, text, bold=False):
+        for t, k, u in _runs(text):
+            if k == "l":
+                link(par, t, u)
+                continue
+            r = par.add_run(t)
+            r.bold = True if bold or k == "b" else None
+            r.italic = True if k == "i" else None
+            if k == "c":
+                r.font.name = "Consolas"
+
+    count = {}
+    for b in blocks:
+        kind = b[0]
+        if kind != "li":
+            count.clear()
+        if kind == "h":
+            level = 0 if titled and b is blocks[0] else min(max(b[1] - (1 if titled else 0), 1), 4)
+            fill(doc.add_heading("", level), b[2])
+        elif kind == "p":
+            fill(doc.add_paragraph(), b[1])
+        elif kind == "li":
+            _, lvl, ordered, text = b
+            for k in [k for k in count if k > lvl]:
+                del count[k]
+            if ordered:
+                count[lvl] = count.get(lvl, 0) + 1
+                p = doc.add_paragraph()
+                indent = Inches(0.25 * (lvl + 1))
+                p.paragraph_format.left_indent = indent
+                p.paragraph_format.first_line_indent = Inches(-0.25)
+                p.paragraph_format.tab_stops.add_tab_stop(indent)
+                p.paragraph_format.space_after = Pt(3)
+                p.add_run(f"{count[lvl]}.\t")
+            else:
+                count.pop(lvl, None)
+                p = doc.add_paragraph(style="List Bullet" + (f" {lvl + 1}" if lvl else ""))
+            fill(p, text)
+        elif kind == "table":
+            rows = b[1]
+            if not rows:
+                continue
+            table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+            table.style = "Table Grid"
+            for ri, row in enumerate(rows):
+                for ci, text in enumerate(row):
+                    cell = table.cell(ri, ci)
+                    fill(cell.paragraphs[0], text, bold=ri == 0)
+                    if ri == 0:
+                        shade(cell._tc.get_or_add_tcPr(), "D9E2F3")
+            doc.add_paragraph()
+        elif kind == "code":
+            p = doc.add_paragraph()
+            r = p.add_run(b[1])
+            r.font.name = "Consolas"
+            r.font.size = Pt(9.5)
+            shade(p._p.get_or_add_pPr(), "F2F2F2")
+        elif kind == "quote":
+            fill(doc.add_paragraph(style="Quote"), b[1])
+        elif kind == "hr":
+            p = doc.add_paragraph()
+            pb, bt = OxmlElement("w:pBdr"), OxmlElement("w:bottom")
+            for k, v in (("val", "single"), ("sz", "6"), ("space", "1"), ("color", "A6A6A6")):
+                bt.set(qn(f"w:{k}"), v)
+            pb.append(bt)
+            p._p.get_or_add_pPr().append(pb)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+_PDF_MAP = {"→": "->", "←": "<-", "≥": ">=", "≤": "<=", "≠": "!=", "✓": "+", "✔": "+", "✗": "x", "✘": "x", "−": "-", "\u00a0": " ", "\u2009": " ", "\u202f": " "}
+
+
+def _pdf_text(s):
+    import unicodedata
+
+    out = []
+    for c in s:
+        if c in _PDF_MAP:
+            out.append(_PDF_MAP[c])
+            continue
+        try:
+            c.encode("cp1252")
+            out.append(c)
+        except UnicodeEncodeError:
+            a = unicodedata.normalize("NFKD", c).encode("ascii", "ignore").decode()
+            out.append(a if a else ("" if unicodedata.category(c) in ("So", "Sk", "Cs", "Cf", "Mn", "Mc") else "?"))
+    return "".join(out)
+
+
+def _pdf(md):
+    import textwrap
+    from xml.sax.saxutils import escape
+
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import HRFlowable, Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    ink = colors.HexColor("#1F2937")
+    base = ParagraphStyle("b", fontName="Helvetica", fontSize=10.5, leading=15, textColor=ink, spaceAfter=6)
+    sizes = {0: 22, 1: 17, 2: 14, 3: 12, 4: 11, 5: 10.5}
+    head = {n: ParagraphStyle(f"h{n}", parent=base, fontName="Helvetica-Bold", fontSize=sz, leading=sz * 1.25, spaceBefore=12 if n else 0, spaceAfter=6, keepWithNext=1, textColor=colors.HexColor("#1E1B4B")) for n, sz in sizes.items()}
+    code = ParagraphStyle("c", parent=base, fontName="Courier", fontSize=8.5, leading=11, backColor=colors.HexColor("#F3F4F6"), borderPadding=5, spaceBefore=4, spaceAfter=10)
+    quote = ParagraphStyle("q", parent=base, leftIndent=12, textColor=colors.HexColor("#4B5563"), fontName="Helvetica-Oblique")
+    cellst = ParagraphStyle("t", parent=base, fontSize=9, leading=12, spaceAfter=0)
+    cellhd = ParagraphStyle("th", parent=cellst, fontName="Helvetica-Bold")
+
+    def markup(text):
+        parts = []
+        for t, k, u in _runs(_pdf_text(text)):
+            t = escape(t)
+            if k == "b":
+                t = f"<b>{t}</b>"
+            elif k == "i":
+                t = f"<i>{t}</i>"
+            elif k == "c":
+                t = f'<font name="Courier">{t}</font>'
+            elif k == "l":
+                t = f'<a href="{escape(u, {chr(34): "%22"})}" color="#0563C1"><u>{t}</u></a>'
+            parts.append(t)
+        return "".join(parts)
+
+    blocks = _blocks(md)
+    titled = bool(blocks) and blocks[0][0] == "h" and blocks[0][1] == 1 and sum(1 for b in blocks if b[0] == "h" and b[1] == 1) == 1
+    width = A4[0] - 40 * mm
+    story, count, title = [], {}, ""
+    for b in blocks:
+        kind = b[0]
+        if kind != "li":
+            count.clear()
+        if kind == "h":
+            n = 0 if titled and b is blocks[0] else min(max(b[1] - (1 if titled else 0), 1), 5)
+            title = title or _plain(b[2])
+            story.append(Paragraph(markup(b[2]), head[n]))
+        elif kind == "p":
+            story.append(Paragraph(markup(b[1]), base))
+        elif kind == "li":
+            _, lvl, ordered, text = b
+            for k in [k for k in count if k > lvl]:
+                del count[k]
+            if ordered:
+                count[lvl] = count.get(lvl, 0) + 1
+                mark = f"{count[lvl]}."
+            else:
+                count.pop(lvl, None)
+                mark = "•"
+            style = ParagraphStyle("li", parent=base, leftIndent=16 + 16 * lvl, bulletIndent=4 + 16 * lvl, spaceAfter=3)
+            story.append(Paragraph(markup(text), style, bulletText=mark))
+        elif kind == "table" and b[1]:
+            rows = b[1]
+            data = [[Paragraph(markup(c), cellhd if ri == 0 else cellst) for c in r] for ri, r in enumerate(rows)]
+            weights = [min(max(max(len(r[ci]) for r in rows), 6), 60) for ci in range(len(rows[0]))]
+            widths = [width * w / sum(weights) for w in weights]
+            t = Table(data, colWidths=widths, repeatRows=1)
+            t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#9CA3AF")), ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E0E7FF")), ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+            story += [t, Spacer(1, 10)]
+        elif kind == "code":
+            lines = _pdf_text(b[1]).split("\n")
+            story.append(Preformatted("\n".join(w for ln in lines for w in (textwrap.wrap(ln, 95, drop_whitespace=False, replace_whitespace=False, subsequent_indent="  ") or [""])), code))
+        elif kind == "quote":
+            story.append(Paragraph(markup(b[1]), quote))
+        elif kind == "hr":
+            story.append(HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#9CA3AF"), spaceBefore=6, spaceAfter=8))
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#6B7280"))
+        canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
+        canvas.restoreState()
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, leftMargin=20 * mm, rightMargin=20 * mm, topMargin=20 * mm, bottomMargin=20 * mm, title=title or "Document", author="Ziva").build(story or [Paragraph(" ", base)], onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+def _xcell(v):
+    v = _plain(v.strip()) if "*" in v or "`" in v or "](" in v else v.strip()
+    if v.startswith("="):
+        return v, None
+    m = re.fullmatch(r"(-?)(\$?)(\d[\d,]*)(\.\d+)?(%?)", v)
+    if not m:
+        return v, None
+    sign, cur, whole, dec, pct = m.groups()
+    if "," in whole and not re.fullmatch(r"\d{1,3}(,\d{3})+", whole):
+        return v, None
+    digits = whole.replace(",", "")
+    if (digits.startswith("0") and len(digits) > 1 and not dec) or len(digits) > 12:
+        return v, None
+    num = float(digits + (dec or "")) * (-1 if sign else 1)
+    if pct:
+        return num / 100, "0.00%" if dec else "0%"
+    if cur:
+        return num, '"$"#,##0.00'
+    if dec or "," in whole:
+        return num, "#,##0.00" if dec else "#,##0"
+    return int(num), None
+
+
+def _xlsx(text):
+    import csv
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    sheets = []
+    for line in text.replace("\r", "").split("\n"):
+        h = re.match(r"^#{1,3}\s+(.+?)\s*#*$", line.strip())
+        if h:
+            sheets.append([h.group(1), []])
+            continue
+        if not sheets:
+            sheets.append(["Sheet1", []])
+        sheets[-1][1].append(line)
+    wb, used = Workbook(), set()
+    wb.remove(wb.active)
+    for name, lines in sheets:
+        lines = [ln for ln in lines if ln.strip()]
+        if any(ln.strip().startswith("|") for ln in lines):
+            rows = [_cells(ln) for ln in lines if ln.strip().startswith("|")]
+            rows = [r for r in rows if not all(_SEP.fullmatch(c) for c in r if c) or not any(r)]
+        else:
+            rows = list(csv.reader(lines))
+        rows = [r[:50] for r in rows[:5000]]
+        if not rows:
+            continue
+        title = re.sub(r"[\[\]:*?/\\]", "", _plain(name)).strip()[:31] or f"Sheet{len(used) + 1}"
+        while title.lower() in used:
+            title = title[:28] + f"_{len(used) + 1}"
+        used.add(title.lower())
+        ws = wb.create_sheet(title)
+        for ri, row in enumerate(rows, 1):
+            for ci, raw in enumerate(row, 1):
+                val, fmt = _xcell(raw) if ri > 1 else (_plain(raw.strip()), None)
+                cell = ws.cell(row=ri, column=ci, value=val)
+                cell.alignment = Alignment(vertical="top", wrap_text=ri > 1)
+                if fmt:
+                    cell.number_format = fmt
+                if ri == 1:
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill("solid", fgColor="2E2A63")
+        for ci in range(1, max(len(r) for r in rows) + 1):
+            vals = [ws.cell(row=r, column=ci).value for r in range(1, len(rows) + 1)]
+            longest = max((len(f"{v:,.2f}") + 3 if isinstance(v, (int, float)) else len(str(v or "")) for v in vals), default=8)
+            ws.column_dimensions[get_column_letter(ci)].width = min(max(longest + 3, 10), 60)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+    if not wb.sheetnames:
+        wb.create_sheet("Sheet1")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _pptx(md):
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches, Pt
+
+    indigo, gold, ink = RGBColor(0x1E, 0x1B, 0x4B), RGBColor(0xE9, 0xB4, 0x4C), RGBColor(0x1F, 0x29, 0x37)
+    slides, cur = [], None
+    for b in _blocks(md):
+        if b[0] == "h" and b[1] <= 2:
+            cur = {"title": b[2], "level": b[1], "items": [], "extras": [], "notes": [], "paras": []}
+            slides.append(cur)
+            continue
+        if cur is None:
+            cur = {"title": "Presentation", "level": 1, "items": [], "extras": [], "notes": [], "paras": []}
+            slides.append(cur)
+        if b[0] == "h":
+            cur["items"].append((0, b[2], True))
+        elif b[0] == "p":
+            cur["paras"].append(b[1])
+            cur["items"].append((0, b[1], False))
+        elif b[0] == "li":
+            cur["items"].append((min(b[1], 2), b[3], False))
+        elif b[0] == "quote":
+            cur["notes"].append(b[1])
+        elif b[0] in ("table", "code") and (b[0] == "code" or b[1]):
+            cur["extras"].append((b[0], b[1]))
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    W = 13.333
+
+    def background(slide, color):
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = color
+
+    def bar(slide, left, top, width):
+        from pptx.enum.shapes import MSO_SHAPE
+
+        s = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(0.07))
+        s.fill.solid()
+        s.fill.fore_color.rgb = gold
+        s.line.fill.background()
+
+    def place(shape, left, top, width, height):
+        shape.left, shape.top, shape.width, shape.height = Inches(left), Inches(top), Inches(width), Inches(height)
+
+    def write(par, text, size, color, bold=False):
+        for t, k, u in _runs(text):
+            r = par.add_run()
+            r.text = t
+            r.font.size = Pt(size)
+            r.font.color.rgb = color
+            r.font.bold = True if bold or k == "b" else None
+            r.font.italic = True if k == "i" else None
+            if k == "c":
+                r.font.name = "Consolas"
+            if k == "l":
+                r.hyperlink.address = u
+
+    def title_slide(s):
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
+        background(slide, indigo)
+        bar(slide, 0.9, 2.1, 1.6)
+        place(slide.shapes.title, 0.9, 2.3, W - 1.8, 1.7)
+        tf = slide.shapes.title.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = 1
+        write(p, s["title"], 46, gold, True)
+        sub = slide.placeholders[1]
+        place(sub, 0.9, 4.2, W - 1.8, 1.6)
+        sub.text_frame.word_wrap = True
+        first = True
+        for text in s["paras"] or [t for _, t, _ in s["items"]]:
+            p = sub.text_frame.paragraphs[0] if first else sub.text_frame.add_paragraph()
+            first = False
+            p.alignment = 1
+            write(p, text, 22, RGBColor(0xE5, 0xE7, 0xEB))
+        return slide
+
+    def content_slide(title, items, extras, size):
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        background(slide, RGBColor(0xFF, 0xFF, 0xFF))
+        place(slide.shapes.title, 0.7, 0.4, W - 1.4, 1.0)
+        slide.shapes.title.text_frame.word_wrap = True
+        p = slide.shapes.title.text_frame.paragraphs[0]
+        p.alignment = 1
+        write(p, title, 32, indigo, True)
+        bar(slide, 0.7, 1.5, 1.2)
+        body = slide.placeholders[1]
+        y = 1.9
+        if items:
+            height = min(2.8, 0.6 * len(items) + 0.4) if extras else 5.1
+            place(body, 0.7, y, W - 1.4, height)
+            body.text_frame.word_wrap = True
+            for n, (lvl, text, bold) in enumerate(items):
+                p = body.text_frame.paragraphs[0] if n == 0 else body.text_frame.add_paragraph()
+                p.level = lvl
+                p.space_after = Pt(8)
+                write(p, text, size - 2 * lvl, ink, bold)
+            y += height + 0.2
+        else:
+            body._element.getparent().remove(body._element)
+        for kind, data in extras:
+            if kind == "table":
+                rows, cols = len(data), len(data[0])
+                fs = 18 if rows <= 6 and cols <= 5 else 13
+                rh = 0.6 if fs == 18 else 0.45
+                shape = slide.shapes.add_table(rows, cols, Inches(0.7), Inches(y), Inches(W - 1.4), Inches(rh * rows))
+                for ri, row in enumerate(data):
+                    for ci, text in enumerate(row):
+                        cell = shape.table.cell(ri, ci)
+                        cell.text_frame.word_wrap = True
+                        write(cell.text_frame.paragraphs[0], text, fs, RGBColor(0xFF, 0xFF, 0xFF) if ri == 0 else ink, ri == 0)
+                        if ri == 0:
+                            cell.fill.solid()
+                            cell.fill.fore_color.rgb = indigo
+                y += rh * rows + 0.2
+            else:
+                lines = _pdf_text(data).split("\n")[:16]
+                box = slide.shapes.add_textbox(Inches(0.7), Inches(y), Inches(W - 1.4), Inches(0.3 * len(lines) + 0.3))
+                box.fill.solid()
+                box.fill.fore_color.rgb = RGBColor(0xF3, 0xF4, 0xF6)
+                box.text_frame.word_wrap = True
+                for n, ln in enumerate(lines):
+                    p = box.text_frame.paragraphs[0] if n == 0 else box.text_frame.add_paragraph()
+                    r = p.add_run()
+                    r.text = ln
+                    r.font.name = "Consolas"
+                    r.font.size = Pt(16)
+                    r.font.color.rgb = ink
+                y += 0.3 * len(lines) + 0.5
+        return slide
+
+    for n, s in enumerate(slides[:60]):
+        if n == 0 and s["level"] == 1 and len(slides) > 1 and not s["extras"] and len(s["paras"]) == len(s["items"]):
+            slide = title_slide(s)
+        else:
+            tables = [e for e in s["extras"] if e[0] == "table"]
+            others = [e for e in s["extras"] if e[0] != "table"]
+            chunks = [s["items"][i:i + 7] for i in range(0, max(len(s["items"]), 1), 7)] or [[]]
+            if tables and len(tables[0][1]) > 10:
+                head, body_rows = tables[0][1][0], tables[0][1][1:]
+                tabs = [("table", [head] + body_rows[i:i + 9]) for i in range(0, len(body_rows), 9)]
+            else:
+                tabs = tables
+            chars = sum(len(t) for _, t, _ in s["items"])
+            size = 30 if len(s["items"]) <= 4 and chars < 300 else 26 if len(s["items"]) <= 6 and chars < 550 else 22
+            pages = max(len(chunks), len(tabs), 1)
+            for pg in range(pages):
+                extras = ([tabs[pg]] if pg < len(tabs) else []) + (others if pg == 0 else [])
+                slide = content_slide(s["title"] + (" (cont.)" if pg else ""), chunks[pg] if pg < len(chunks) else [], extras, size)
+                if s["notes"]:
+                    slide.notes_slide.notes_text_frame.text = "\n".join(s["notes"])
+            continue
+        if s["notes"]:
+            slide.notes_slide.notes_text_frame.text = "\n".join(s["notes"])
+    if not slides:
+        content_slide("Presentation", [], [], 24)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+EXPORTERS = {"docx": _docx, "pdf": _pdf, "xlsx": _xlsx, "pptx": _pptx}
+
+
+class ExportRequest(BaseModel):
+    name: str
+    text: str
+
+
+@app.post("/api/export")
+async def export_file(req: ExportRequest):
+    ext = req.name.rsplit(".", 1)[-1].lower() if "." in req.name else ""
+    build = EXPORTERS.get(ext)
+    if not build:
+        raise HTTPException(400, "Unsupported file type.")
+    if len(req.text) > EXPORT_MAX:
+        raise HTTPException(413, "That file is too large to convert.")
+    if not _export_slots.acquire(blocking=False):
+        raise HTTPException(429, "Busy converting other files. Try again in a moment.")
+    try:
+        data = await run_in_threadpool(build, req.text)
+    except ImportError:
+        raise HTTPException(503, f"The .{ext} converter is not installed on this server.")
+    except Exception:
+        log.exception("Export to %s failed", ext)
+        raise HTTPException(500, "Could not build that file.")
+    finally:
+        _export_slots.release()
+    safe = re.sub(r"[^\w.\-]+", "_", req.name.split("/")[-1]) or f"ziva.{ext}"
+    return Response(data, media_type=EXPORT_TYPES[ext], headers={"Content-Disposition": f'attachment; filename="{safe}"'})
 
 
 @app.get("/api/config")
@@ -1500,7 +2100,7 @@ function makeZip(files) {
   let off = 0;
   const d = new Date(), dt = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(), tm = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
   for (const f of files) {
-    const nb = enc.encode(f.name), data = enc.encode(f.text), crc = crc32(data);
+    const nb = enc.encode(f.name), data = f.data || enc.encode(f.text), crc = crc32(data);
     const h = new DataView(new ArrayBuffer(30));
     h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(10, tm, true); h.setUint16(12, dt, true);
     h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, nb.length, true);
@@ -1514,6 +2114,25 @@ function makeZip(files) {
   const size = central.reduce((a, b) => a + b.byteLength, 0), e = new DataView(new ArrayBuffer(22));
   e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, size, true); e.setUint32(16, off, true);
   return new Blob([...parts, ...central, e.buffer], { type: "application/zip" });
+}
+const OFFICE = /\.(docx|pdf|xlsx|pptx)$/i;
+async function officeBlob(name, text) {
+  const r = await fetch("/api/export", { method: "POST", headers: JSON_H, body: JSON.stringify({ name, text }) });
+  if (!r.ok) {
+    let msg = "Could not build the file.";
+    try { msg = (await r.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return r.blob();
+}
+async function busyBtn(btn, work) {
+  const label = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = "Building…";
+  let failed = "";
+  try { await work(); } catch (err) { failed = err.message || "Failed"; }
+  btn.disabled = false;
+  if (failed) { btn.textContent = failed; setTimeout(() => { btn.innerHTML = label; }, 3000); } else btn.innerHTML = label;
 }
 function dlBlob(name, blob) {
   const a = document.createElement("a");
@@ -1617,13 +2236,20 @@ thread.addEventListener("click", async e => {
       if (seen[name]) { const i = name.lastIndexOf("."); name = i > 0 ? name.slice(0, i) + `-${seen[name] + 1}` + name.slice(i) : name + `-${seen[name] + 1}`; seen[f.querySelector(".fn span").textContent]++; } else seen[name] = 1;
       return { name, text: f.querySelector("code").textContent };
     });
-    dlBlob("ziva-files.zip", makeZip(list));
+    await busyBtn(z, async () => {
+      for (const f of list) if (OFFICE.test(f.name)) f.data = new Uint8Array(await (await officeBlob(f.name, f.text)).arrayBuffer());
+      dlBlob("ziva-files.zip", makeZip(list));
+    });
     return;
   }
   const fb = e.target.closest(".dl, .cp2");
   if (fb) {
     const f = fb.closest(".file"), text = f.querySelector("code").textContent;
-    if (fb.classList.contains("dl")) dlBlob(f.querySelector(".fn span").textContent.split("/").pop(), new Blob([text], { type: "text/plain;charset=utf-8" }));
+    const fname = f.querySelector(".fn span").textContent;
+    if (fb.classList.contains("dl")) {
+      if (OFFICE.test(fname)) await busyBtn(fb, async () => dlBlob(fname.split("/").pop(), await officeBlob(fname, text)));
+      else dlBlob(fname.split("/").pop(), new Blob([text], { type: "text/plain;charset=utf-8" }));
+    }
     else try { await navigator.clipboard.writeText(text); fb.textContent = "Copied"; setTimeout(() => { fb.textContent = "Copy"; }, 1500); } catch (err) {}
     return;
   }

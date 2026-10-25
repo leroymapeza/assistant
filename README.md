@@ -22,6 +22,10 @@ Open http://127.0.0.1:8000. The key can also come from the `GOOGLE_API_KEY` envi
 | `tavily_api_key` | Key for Tavily web search (free tier). Also read from the `TAVILY_API_KEY` environment variable. Without it, Ziva falls back to keyless DuckDuckGo search |
 | `web_search` | `false` to turn web search off |
 
+## File output
+
+Ask Ziva for a Word, PDF, Excel or PowerPoint file (for example "make me a one-page report as a PDF"). Each file appears in the chat with a Download button, and several files can be downloaded together as a zip. Conversion happens on the server through `/api/export` using `python-docx`, `reportlab`, `openpyxl` and `python-pptx`, so no extra model call is used.
+
 ## Public demo
 
 Set `ZIVA_DEMO=1` to run it safely in public. Each visitor gets a private workspace tied to a cookie, data expires after a set time, and messages are rate limited per visitor, per IP and per day.

@@ -2,3 +2,7 @@ fastapi
 uvicorn[standard]
 google-genai
 ddgs
+python-docx
+openpyxl
+reportlab
+python-pptx
