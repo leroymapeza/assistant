@@ -9,7 +9,11 @@ import sqlite3
 import ssl
 import threading
 import time
+import base64
+import io
+import mimetypes
 import urllib.error
+import zipfile
 import urllib.request
 import html as htmllib
 from concurrent.futures import ThreadPoolExecutor
@@ -208,6 +212,8 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, role TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, error INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)")
+        conn.execute("CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, name TEXT NOT NULL, mime TEXT NOT NULL, data BLOB NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments(message_id)")
         for table in ("notes", "reminders", "conversations"):
             _ensure_owner(conn, table)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner, updated_at)")
@@ -289,10 +295,18 @@ def _purge(force=False):
 class Turn(BaseModel):
     role: str
     text: str
+    files: list = []
+
+
+class Attachment(BaseModel):
+    name: str
+    mime: str = ""
+    data: str
 
 
 class ChatRequest(BaseModel):
     message: str
+    files: list[Attachment] = []
     conversation_id: int | None = None
     replace_from: int | None = None
     retry: bool = False
@@ -330,16 +344,75 @@ def _add_message(conn, conv, role, text, error=False):
 
 
 def _history(conn, conv):
-    rows = conn.execute("SELECT role, text, error FROM messages WHERE conversation_id = ? ORDER BY id", (conv,)).fetchall()
+    rows = conn.execute("SELECT id, role, text, error FROM messages WHERE conversation_id = ? ORDER BY id", (conv,)).fetchall()
     turns, pending = [], None
     for r in rows:
         if r["role"] == "user":
-            pending = r["text"]
+            pending = (r["id"], r["text"])
         else:
             if pending is not None and not r["error"] and r["text"].strip():
-                turns += [Turn(role="user", text=pending), Turn(role="assistant", text=_strip_sources(r["text"]))]
+                files = [(a["name"], a["mime"], a["data"]) for a in conn.execute("SELECT name, mime, data FROM attachments WHERE message_id = ?", (pending[0],))]
+                turns += [Turn(role="user", text=pending[1], files=files), Turn(role="assistant", text=_strip_sources(r["text"]))]
             pending = None
-    return turns[-12:]
+    turns = turns[-12:]
+    for t in turns[:-6]:
+        if t.files:
+            t.text += "\n[Earlier attachments no longer loaded: " + ", ".join(f[0] for f in t.files) + "]"
+            t.files = []
+    return turns
+
+
+MAX_FILE = (2 if DEMO else 8) * 1024 * 1024
+MAX_FILES = 4
+
+
+def _decode_files(files):
+    if len(files) > MAX_FILES:
+        return [], f"You can attach up to {MAX_FILES} files per message."
+    out, total = [], 0
+    for f in files:
+        try:
+            raw = base64.b64decode(f.data)
+        except Exception:
+            return [], f"Couldn’t read “{f.name}”. Try attaching it again."
+        if len(raw) > MAX_FILE:
+            return [], f"“{f.name}” is larger than {MAX_FILE // 1048576} MB."
+        total += len(raw)
+        name = os.path.basename(f.name.replace("\\", "/"))[:120] or "file"
+        out.append((name, f.mime or mimetypes.guess_type(name)[0] or "application/octet-stream", raw))
+    if total > MAX_FILE * 2:
+        return [], "Those files are too large together. Attach fewer or smaller files."
+    return out, None
+
+
+def _file_text(name, mime, raw):
+    if name.lower().endswith(".docx"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "ignore")
+            return htmllib.unescape(re.sub(r"<[^>]+>", "", xml.replace("</w:p>", "\n"))).strip()
+        except Exception:
+            return None
+    if b"\0" in raw[:4096]:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1") if mime.startswith("text/") else None
+
+
+def _file_parts(files):
+    parts = []
+    for name, mime, raw in files:
+        if (mime.split("/")[0] in ("image", "audio", "video") and "svg" not in mime) or mime == "application/pdf":
+            parts += [types.Part.from_bytes(data=raw, mime_type=mime), types.Part(text=f"[The file above is: {name}]")]
+            continue
+        text = _file_text(name, mime, raw)
+        if text is None:
+            parts.append(types.Part(text=f"[Attached file “{name}” could not be read: unsupported type]"))
+        else:
+            parts.append(types.Part(text=f"[Attached file: {name}]\n```\n{text[:200000]}\n```"))
+    return parts
 
 
 def add_note(text):
@@ -458,7 +531,13 @@ RULES = (
     "verify something, say so plainly instead of guessing.\n"
     "4. Never invent URLs, quotes, figures, dates or source names. Give dates for time-sensitive facts.\n"
     "5. Skip searching only for greetings, small talk, arithmetic, and writing or coding tasks needing no outside facts.\n"
-    "6. Do not write a sources list or link list yourself; the app displays sources automatically."
+    "6. Do not write a sources list or link list yourself; the app displays sources automatically.\n"
+    "7. When the user attaches files, read them and base your answer on their actual contents.\n"
+    "8. When the user asks you to create, write or give them a file (or several files), output each file as its own "
+    "fenced code block whose opening fence is exactly the filename, for example ```index.html or ```notes/todo.md. "
+    "One file per block, complete contents, no placeholders or omissions. The app turns each block into a download "
+    "and bundles several into a zip. You can only produce text-based files (code, HTML, CSS, JSON, CSV, Markdown, text); "
+    "never say you cannot create files."
 )
 
 
@@ -535,9 +614,9 @@ def _sources_block(found):
     return f"\n\n{SRC_MARK}{payload}{SRC_END}"
 
 
-def stream_reply(client, history, message):
-    contents = [types.Content(role="user" if t.role == "user" else "model", parts=[types.Part(text=t.text)]) for t in history]
-    contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
+def stream_reply(client, history, message, files=()):
+    contents = [types.Content(role="user" if t.role == "user" else "model", parts=_file_parts(t.files) + [types.Part(text=t.text)]) for t in history]
+    contents.append(types.Content(role="user", parts=_file_parts(files) + [types.Part(text=message)]))
     system = RULES.format(today=datetime.now().strftime("%A, %d %B %Y"))
     toolsets = [[types.Tool(google_search=types.GoogleSearch())]]
     if load_config().get("read_pages"):
@@ -624,12 +703,12 @@ def stream_openai(cfg, history, message):
                 yield piece
 
 
-def reply_stream(client, history, message):
+def reply_stream(client, history, message, files=()):
     cfg = load_config()
     local = cfg.get("openai_compat")
     backends = []
     if client:
-        backends.append(lambda: stream_reply(client, history, message))
+        backends.append(lambda: stream_reply(client, history, message, files))
     if local:
         backends.append(lambda: stream_openai(local, history, message))
     if cfg.get("chat_backend") == "local":
@@ -658,7 +737,7 @@ def home():
     return HTML_PAGE
 
 
-def _produce(message, history):
+def _produce(message, history, files=()):
     command = COMMANDS.get(message.lower())
     if command:
         return "text", command(), False, False
@@ -679,7 +758,7 @@ def _produce(message, history):
             return "text", list_notes(), False, False
         if action == "list_reminders":
             return "text", list_reminders(), False, False
-        stream = reply_stream(client, history, message)
+        stream = reply_stream(client, history, message, files)
         return "stream", stream, next(stream)
     except StopIteration:
         return "text", "I didn’t get an answer back. Try rephrasing that.", True, False
@@ -689,8 +768,12 @@ def _produce(message, history):
 
 def _start_turn(req, blocked=None):
     message = (req.message or "").strip()[:MAX_LEN]
-    if not message:
+    files, ferr = _decode_files(req.files)
+    blocked = blocked or ferr
+    if not message and not files and not blocked:
         raise HTTPException(400, "Empty message")
+    if not message and files:
+        message = "Please read the attached file(s)."
     with db() as conn:
         conv = req.conversation_id
         if not conv or not conn.execute("SELECT 1 FROM conversations WHERE id = ? AND owner = ?", (conv, _owner.get())).fetchone():
@@ -698,14 +781,18 @@ def _start_turn(req, blocked=None):
         start = req.replace_from
         if req.retry:
             start = conn.execute("SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'user'", (conv,)).fetchone()[0]
+        if start and not files and not blocked:
+            files = [(a["name"], a["mime"], a["data"]) for a in conn.execute("SELECT a.name, a.mime, a.data FROM attachments a JOIN messages m ON m.id = a.message_id WHERE a.message_id = ? AND m.conversation_id = ? AND m.role = 'user'", (start, conv))]
         if start:
             conn.execute("DELETE FROM messages WHERE conversation_id = ? AND id >= ?", (conv, start))
         if not conn.execute("SELECT 1 FROM messages WHERE conversation_id = ?", (conv,)).fetchone():
             conn.execute("UPDATE conversations SET title = ? WHERE id = ?", (DEFAULT_TITLE, conv))
         history = _history(conn, conv)
         user_id = _add_message(conn, conv, "user", message)
+        if files and not blocked:
+            conn.executemany("INSERT INTO attachments (message_id, name, mime, data) VALUES (?, ?, ?, ?)", [(user_id, n, m, d) for n, m, d in files])
         conn.execute("UPDATE conversations SET title = ? WHERE id = ? AND title = ?", (_title_from(message), conv, DEFAULT_TITLE))
-    return conv, user_id, ("text", blocked, True, False) if blocked else _produce(message, history)
+    return conv, user_id, ("text", blocked, True, False) if blocked else _produce(message, history, files)
 
 
 def _save_assistant(conv, text, error=False):
@@ -759,7 +846,7 @@ async def chat_endpoint(req: ChatRequest, request: Request):
 
 @app.get("/api/config")
 def public_config():
-    return {"demo": DEMO, "hourly": HOURLY, "ttl": TTL_HOURS}
+    return {"demo": DEMO, "hourly": HOURLY, "ttl": TTL_HOURS, "max_mb": MAX_FILE // 1048576, "max_files": MAX_FILES}
 
 
 @app.get("/api/conversations")
@@ -792,7 +879,10 @@ def get_conversation(conv_id: int):
         if not conv:
             raise HTTPException(404)
         rows = conn.execute("SELECT id, role, text, error, stopped FROM messages WHERE conversation_id = ? ORDER BY id", (conv_id,))
-        return {**dict(conv), "messages": [dict(r) for r in rows]}
+        files = {}
+        for a in conn.execute("SELECT a.message_id, a.name, a.mime, length(a.data) AS size FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.conversation_id = ? ORDER BY a.id", (conv_id,)):
+            files.setdefault(a["message_id"], []).append({"name": a["name"], "mime": a["mime"], "size": a["size"]})
+        return {**dict(conv), "messages": [{**dict(r), "files": files.get(r["id"], [])} for r in rows]}
 
 
 @app.patch("/api/conversations/{conv_id}")
@@ -939,6 +1029,28 @@ body.noside .lead .mark{display:grid}
 .cp:hover{color:var(--text)}
 @media(hover:none){.cp{opacity:1}}
 .hint{color:var(--muted)}
+.tray{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px;padding:0 4px}
+.fchip{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:5px 10px;border-radius:999px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--line);font-size:13px;color:var(--text)}
+.fchip>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+.fchip svg{flex:none;color:var(--gold)}
+.fchip button{display:grid;place-items:center;border:0;background:none;color:var(--muted);padding:2px;border-radius:50%}
+.fchip button:hover{color:var(--text);background:var(--raised)}
+.tnote{font-size:13px;color:var(--copper);padding:5px 4px}
+.fl{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end;margin-bottom:6px}
+.fl:empty{display:none}
+.file{margin:.4em 0 .75em;border-radius:12px;background:var(--panel);overflow:hidden}
+.fhead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px 6px 12px;background:var(--raised);font-size:13px}
+.fn{display:flex;align-items:center;gap:7px;min-width:0;color:var(--muted)}
+.fn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fn svg{flex:none;color:var(--gold)}
+.fa{display:flex;gap:4px;flex:none}
+.fa button{border:0;border-radius:8px;padding:3px 10px;font-size:12px;background:rgba(255,255,255,.06);color:var(--text)}
+.fa button:hover{background:var(--gold);color:var(--ink)}
+.body .file pre{margin:0;border-radius:0;max-height:340px;overflow:auto}
+.zbar{margin-top:8px}
+.zbar:empty{display:none}
+.zipbtn{display:inline-flex;align-items:center;gap:8px;border:0;border-radius:999px;padding:7px 14px;background:var(--gold);color:var(--ink);font-weight:600;font-size:13.5px}
+.zipbtn:hover{background:#F6C26A}
 .src{margin-top:12px}
 .src:empty{display:none}
 .srcbtn{display:inline-flex;align-items:center;gap:10px;background:var(--panel);border:0;border-radius:999px;padding:5px 14px 5px 6px;color:var(--muted);font-size:13px;box-shadow:inset 0 0 0 1px var(--line);cursor:pointer;transition:background .15s,color .15s}
@@ -980,7 +1092,7 @@ body.noside .lead .mark{display:grid}
 .btn.ghost{background:var(--raised);color:var(--text)}
 .composer{position:relative;padding:6px 0 max(18px,env(safe-area-inset-bottom))}
 .jump{position:absolute;left:50%;top:-44px;transform:translateX(-50%);width:36px;height:36px;border:0;border-radius:50%;background:var(--raised);color:var(--text);display:grid;place-items:center;box-shadow:0 6px 18px rgba(0,0,0,.4),inset 0 0 0 1px var(--line)}
-.box{display:flex;align-items:flex-end;gap:2px;background:var(--panel);border-radius:26px;padding:6px 6px 6px 20px;box-shadow:inset 0 0 0 1px var(--line),0 10px 30px rgba(0,0,0,.35);transition:box-shadow .2s}
+.box{display:flex;align-items:flex-end;gap:2px;background:var(--panel);border-radius:26px;padding:6px 6px 6px 8px;box-shadow:inset 0 0 0 1px var(--line),0 10px 30px rgba(0,0,0,.35);transition:box-shadow .2s}
 .box:focus-within{box-shadow:inset 0 0 0 1px rgba(240,179,74,.55),0 10px 30px rgba(0,0,0,.35)}
 textarea{flex:1;min-width:0;resize:none;background:none;border:0;outline:0;color:inherit;font:inherit;line-height:1.5;padding:8px 0;max-height:160px}
 textarea:focus-visible{outline:0}
@@ -1045,7 +1157,7 @@ li.none{padding:22px 0}
   .empty p{margin-bottom:18px;font-size:15.5px}
   .chip{padding:10px 12px;font-size:14px}
   .composer{padding:4px 0 max(10px,env(safe-area-inset-bottom))}
-  .box{padding:4px 4px 4px 16px;border-radius:24px}
+  .box{padding:4px 4px 4px 6px;border-radius:24px}
   textarea,.search input,.rename,.edit{font-size:16px}
   .ibtn{width:36px;height:36px}
   .tool{padding:6px}
@@ -1084,7 +1196,10 @@ li.none{padding:22px 0}
     <main id="chat"><div class="col thread" id="thread"></div></main>
     <form id="form" class="col composer">
       <button id="jump" class="jump" type="button" aria-label="Scroll to latest" data-ic="down" hidden></button>
+      <div id="tray" class="tray" hidden></div>
       <div class="box">
+        <input type="file" id="picker" multiple hidden>
+        <button id="attach" class="ibtn" type="button" title="Attach files" aria-label="Attach files" data-ic="clip"></button>
         <textarea id="input" rows="1" placeholder="Message Ziva" aria-label="Message"></textarea>
         <button id="speak" class="ibtn" type="button" aria-pressed="false" title="Read replies aloud" data-ic="speaker"></button>
         <button id="mic" class="ibtn" type="button" aria-pressed="false" title="Speak to Ziva" data-ic="mic"></button>
@@ -1124,6 +1239,8 @@ const ICONS = {
   search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
   panel: '<rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M9.5 4.5v15"/>',
   download: '<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
+  clip: '<path d="m21 11.5-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l8.6-8.6a3.7 3.7 0 0 1 5.2 5.2l-8.6 8.6a1.8 1.8 0 0 1-2.6-2.6l7.9-7.9"/>',
+  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5"/>',
   edit: '<path d="M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4"/>',
   retry: '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>'
 };
@@ -1139,17 +1256,25 @@ function inline(s) {
       .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?!\*)/g, "$1<em>$2</em>")
       .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')).join("");
 }
-const pre = c => '<pre><button type="button" class="cp">Copy</button><code>' + esc(c.join("\n")) + "</code></pre>";
+function fileName(info) {
+  for (const tok of (info || "").split(/[\s:=,]+/)) if (/^[\w\-./]+\.[A-Za-z0-9]{1,8}$/.test(tok)) return tok.replace(/^\/+/, "").replace(/\.\.\//g, "");
+  return "";
+}
+const pre = (c, info) => {
+  const text = c.join("\n"), fn = fileName(info);
+  if (!fn) return '<pre><button type="button" class="cp">Copy</button><code>' + esc(text) + "</code></pre>";
+  return `<div class="file"><div class="fhead"><span class="fn">${ic("file", 14)}<span>${esc(fn)}</span></span><span class="fa"><button type="button" class="cp2">Copy</button><button type="button" class="dl">Download</button></span></div><pre><code>${esc(text)}</code></pre></div>`;
+};
 function render(md) {
-  let html = "", list = null, para = [], code = null;
+  let html = "", list = null, para = [], code = null, info = "";
   const flushPara = () => { if (para.length) { html += "<p>" + para.map(inline).join("<br>") + "</p>"; para = []; } };
   const flushList = () => { if (list) { html += "</" + list + ">"; list = null; } };
   for (const line of md.replace(/\r/g, "").split("\n")) {
     if (code !== null) {
-      if (/^```/.test(line)) { html += pre(code); code = null; } else code.push(line);
+      if (/^```/.test(line)) { html += pre(code, info); code = null; } else code.push(line);
       continue;
     }
-    if (/^```/.test(line)) { flushPara(); flushList(); code = []; continue; }
+    if (/^```/.test(line)) { flushPara(); flushList(); code = []; info = line.slice(3).trim(); continue; }
     const li = line.match(/^\s*([-*+]|\d+\.)\s+(.*)$/);
     if (li) {
       flushPara();
@@ -1163,7 +1288,7 @@ function render(md) {
     if (h) { flushPara(); flushList(); html += "<h4>" + inline(h[1]) + "</h4>"; continue; }
     flushList(); para.push(line);
   }
-  if (code !== null) html += pre(code);
+  if (code !== null) html += pre(code, info);
   flushPara(); flushList();
   return html;
 }
@@ -1207,14 +1332,51 @@ function shell(role) {
   const el = document.createElement("div");
   el.className = "msg " + role;
   el.innerHTML = role === "user"
-    ? '<div class="stack"><div class="bubble"></div><div class="tools"></div></div>'
-    : '<div class="main"><div class="body"></div><div class="src"></div><div class="tools"></div></div>';
+    ? '<div class="stack"><div class="fl"></div><div class="bubble"></div><div class="tools"></div></div>'
+    : '<div class="main"><div class="body"></div><div class="zbar"></div><div class="src"></div><div class="tools"></div></div>';
   return el;
 }
 function paintBody(el, m) {
   el.querySelector(".body").innerHTML = m.text ? render(m.text) : m.stopped ? '<p class="hint">Stopped before a reply.</p>' : "";
   paintSrc(el, m.sources);
+  paintZip(el);
 }
+function paintZip(el) {
+  const z = el.querySelector(".zbar");
+  if (!z) return;
+  const n = el.querySelectorAll(".body .file").length;
+  z.innerHTML = n > 1 ? `<button type="button" class="zipbtn">${ic("download", 15)}Download all ${n} files (.zip)</button>` : "";
+}
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = b => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = [];
+  let off = 0;
+  const d = new Date(), dt = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(), tm = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  for (const f of files) {
+    const nb = enc.encode(f.name), data = enc.encode(f.text), crc = crc32(data);
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(10, tm, true); h.setUint16(12, dt, true);
+    h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, nb.length, true);
+    parts.push(h.buffer, nb, data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(12, tm, true); c.setUint16(14, dt, true);
+    c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, nb.length, true); c.setUint32(42, off, true);
+    central.push(c.buffer, nb);
+    off += 30 + nb.length + data.length;
+  }
+  const size = central.reduce((a, b) => a + b.byteLength, 0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, size, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, e.buffer], { type: "application/zip" });
+}
+function dlBlob(name, blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+const fileChip = f => `<span class="fchip">${ic("file", 14)}<span>${esc(f.name)}</span></span>`;
 const SRC = "<!--ziva-sources:";
 function splitSrc(t) {
   t = t || "";
@@ -1268,7 +1430,7 @@ function fillTools(el, m, i) {
 }
 function msgEl(m, i) {
   const el = shell(m.role);
-  if (m.role === "user") el.querySelector(".bubble").textContent = m.text;
+  if (m.role === "user") { el.querySelector(".bubble").textContent = m.text; el.querySelector(".fl").innerHTML = (m.files || []).map(fileChip).join(""); }
   else {
     if (m.error) el.classList.add("error");
     if (m.pending) startThink(el.querySelector(".body")); else paintBody(el, m);
@@ -1302,6 +1464,23 @@ function speak(text) {
   speechSynthesis.speak(u);
 }
 thread.addEventListener("click", async e => {
+  const z = e.target.closest(".zipbtn");
+  if (z) {
+    const seen = {}, list = [...z.closest(".main").querySelectorAll(".file")].map(f => {
+      let name = f.querySelector(".fn span").textContent;
+      if (seen[name]) { const i = name.lastIndexOf("."); name = i > 0 ? name.slice(0, i) + `-${seen[name] + 1}` + name.slice(i) : name + `-${seen[name] + 1}`; seen[f.querySelector(".fn span").textContent]++; } else seen[name] = 1;
+      return { name, text: f.querySelector("code").textContent };
+    });
+    dlBlob("ziva-files.zip", makeZip(list));
+    return;
+  }
+  const fb = e.target.closest(".dl, .cp2");
+  if (fb) {
+    const f = fb.closest(".file"), text = f.querySelector("code").textContent;
+    if (fb.classList.contains("dl")) dlBlob(f.querySelector(".fn span").textContent.split("/").pop(), new Blob([text], { type: "text/plain;charset=utf-8" }));
+    else try { await navigator.clipboard.writeText(text); fb.textContent = "Copied"; setTimeout(() => { fb.textContent = "Copy"; }, 1500); } catch (err) {}
+    return;
+  }
   const b = e.target.closest(".cp");
   if (!b) return;
   try { await navigator.clipboard.writeText(b.parentElement.querySelector("code").textContent); b.textContent = "Copied"; setTimeout(() => { b.textContent = "Copy"; }, 1500); } catch (err) {}
@@ -1349,8 +1528,33 @@ function editMsg(i, el) {
 function grow() {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
-  sendBtn.disabled = !busy && !input.value.trim();
+  sendBtn.disabled = !busy && !input.value.trim() && !pending.length;
 }
+let pending = [], maxMB = 8, maxFiles = 4, noteText = "", noteTimer = null;
+const tray = $("#tray"), picker = $("#picker");
+const OKTYPE = /\.(txt|md|markdown|csv|tsv|json|xml|ya?ml|toml|ini|log|html?|css|jsx?|mjs|tsx?|py|java|c|h|cpp|cs|go|rs|rb|php|sh|bat|ps1|sql|svg|docx|pdf|png|jpe?g|webp|gif|heic|heif|mp3|wav|m4a|ogg|flac|aac|mp4|webm|mov)$/i;
+function drawTray() {
+  tray.hidden = !pending.length && !noteText;
+  tray.innerHTML = pending.map((f, i) => `<span class="fchip">${ic("file", 14)}<span>${esc(f.name)}</span><button type="button" data-i="${i}" aria-label="Remove ${esc(f.name)}">${ic("close", 12)}</button></span>`).join("") + (noteText ? `<span class="tnote">${esc(noteText)}</span>` : "");
+  grow();
+}
+function note(t) { noteText = t; drawTray(); clearTimeout(noteTimer); noteTimer = setTimeout(() => { noteText = ""; drawTray(); }, 4500); }
+const toB64 = f => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(",")[1] || ""); r.onerror = no; r.readAsDataURL(f); });
+async function addFiles(list) {
+  for (const f of list) {
+    if (pending.length >= maxFiles) { note(`Up to ${maxFiles} files per message.`); break; }
+    if (!OKTYPE.test(f.name) && !/^(image|audio|video|text)\//.test(f.type)) { note(`“${f.name}” isn’t a supported file type.`); continue; }
+    if (f.size > maxMB * 1048576) { note(`“${f.name}” is over ${maxMB} MB.`); continue; }
+    try { pending.push({ name: f.name, mime: f.type, size: f.size, data: await toB64(f) }); } catch (e) { note(`Couldn’t read “${f.name}”.`); }
+  }
+  drawTray();
+}
+$("#attach").onclick = () => picker.click();
+picker.onchange = () => { addFiles([...picker.files]); picker.value = ""; };
+tray.addEventListener("click", e => { const b = e.target.closest("button[data-i]"); if (b) { pending.splice(+b.dataset.i, 1); drawTray(); } });
+addEventListener("dragover", e => { if (e.dataTransfer && [...e.dataTransfer.types].includes("Files")) e.preventDefault(); });
+addEventListener("drop", e => { if (e.dataTransfer && e.dataTransfer.files.length) { e.preventDefault(); addFiles([...e.dataTransfer.files]); } });
+input.addEventListener("paste", e => { const fs = [...((e.clipboardData && e.clipboardData.files) || [])]; if (fs.length) { e.preventDefault(); addFiles(fs); } });
 function setBusy(on) {
   busy = on;
   sendBtn.innerHTML = ic(on ? "stop" : "up");
@@ -1373,27 +1577,29 @@ async function fixIds(id, um) {
 }
 async function send(text, replaceFrom, retry) {
   text = (text || "").trim();
-  if (busy || !text) return;
   const fresh = !replaceFrom && !retry;
+  if (busy || (!text && !(fresh && pending.length))) return;
+  const sent = fresh ? pending : [];
   setBusy(true);
   if (!convId) {
     try { convId = (await (await fetch("/api/conversations", { method: "POST" })).json()).id; rememberConv(); }
     catch (e) { setBusy(false); say("Couldn’t reach Ziva. Check that the server is still running, then try again.", true); return; }
   }
   const my = convId;
-  if (fresh) { input.value = ""; grow(); }
+  if (fresh) { input.value = ""; pending = []; drawTray(); }
   let at = -1;
   if (replaceFrom) at = msgs.findIndex(m => m.id === replaceFrom);
   else if (retry) at = msgs.map(m => m.role).lastIndexOf("user");
+  const prevFiles = at >= 0 ? msgs[at].files : undefined;
   if (at >= 0) msgs.length = at;
-  const um = { id: null, role: "user", text }, am = { id: null, role: "assistant", text: "", pending: true };
+  const um = { id: null, role: "user", text: text || "Please read the attached file(s).", files: fresh ? sent.map(({ name, mime, size }) => ({ name, mime, size })) : prevFiles }, am = { id: null, role: "assistant", text: "", pending: true };
   msgs.push(um, am);
   renderAll();
   const el = thread.lastElementChild, body = el.querySelector(".body");
   ctl = new AbortController();
   let full = "", failed = false, aborted = false;
   try {
-    const res = await fetch("/chat", { method: "POST", signal: ctl.signal, headers: JSON_H, body: JSON.stringify({ message: text, conversation_id: my, replace_from: replaceFrom || null, retry: !!retry }) });
+    const res = await fetch("/chat", { method: "POST", signal: ctl.signal, headers: JSON_H, body: JSON.stringify({ message: text, conversation_id: my, replace_from: replaceFrom || null, retry: !!retry, files: sent.map(({ name, mime, data }) => ({ name, mime, data })) }) });
     if (!res.ok) throw new Error("Server returned " + res.status);
     loadConvs();
     if ((res.headers.get("content-type") || "").includes("application/json")) {
@@ -1667,6 +1873,7 @@ document.addEventListener("keydown", e => {
 });
 
 fetch("/api/config").then(r => r.json()).then(c => {
+  maxMB = c.max_mb || maxMB; maxFiles = c.max_files || maxFiles;
   if (!c.demo) return;
   const f = $("#sfoot");
   f.textContent = `Public demo. Your chats stay private to this browser, are deleted after ${c.ttl} hours, and are limited to ${c.hourly} messages an hour.`;
