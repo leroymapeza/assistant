@@ -853,12 +853,13 @@ HTML_PAGE = r"""<!doctype html>
 :root{--bg:#10111A;--panel:#181A27;--raised:#222537;--user:#262A40;--line:rgba(255,255,255,.07);--text:#ECE5D8;--muted:#8E90A8;--gold:#F0B34A;--ink:#2A1D05;--copper:#E0714A;--serif:"Young Serif",Georgia,serif;--sans:"Hanken Grotesk",system-ui,"Segoe UI",sans-serif;color-scheme:dark}
 *{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#2E3248 transparent}
 [hidden]{display:none!important}
-html,body{height:100%;margin:0}
+html,body{height:100%;margin:0;max-width:100%}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
 body{background:var(--bg);color:var(--text);font:15.5px/1.65 var(--sans);-webkit-font-smoothing:antialiased;overflow:hidden}
 button{font:inherit;color:inherit;cursor:pointer}
 :focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 .shell{height:100dvh;display:flex}
-.app{flex:1;min-width:0;height:100dvh;position:relative;display:grid;grid-template-rows:auto auto minmax(0,1fr) auto}
+.app{flex:1;min-width:0;height:100dvh;position:relative;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto minmax(0,1fr) auto}
 .wall{height:8px;background:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='8'%3E%3Cpath d='M0 7.5 5 1.5l5 6 5-6 5 6' fill='none' stroke='%23F0B34A' stroke-width='1.6'/%3E%3C/svg%3E") repeat-x;opacity:.85;-webkit-mask-image:linear-gradient(90deg,transparent,#000 22%,#000 78%,transparent);mask-image:linear-gradient(90deg,transparent,#000 22%,#000 78%,transparent)}
 .col{width:min(720px,calc(100% - 32px));margin-inline:auto}
 .mark{width:28px;height:28px;flex:none;display:grid;place-items:center}
@@ -900,7 +901,7 @@ body.noside .lead .mark{display:grid}
 .pill{display:flex;align-items:center;gap:8px;background:none;border:0;border-radius:999px;padding:8px 12px;font-size:14px;color:var(--muted);transition:background .15s,color .15s}
 .pill:hover{background:var(--panel);color:var(--text)}
 #badge{background:var(--gold);color:var(--ink);border-radius:999px;font-size:11px;font-weight:600;min-width:18px;height:18px;padding:0 5px;display:grid;place-items:center}
-#chat{overflow-y:auto;-webkit-mask-image:linear-gradient(transparent,#000 14px,#000 calc(100% - 22px),transparent);mask-image:linear-gradient(transparent,#000 14px,#000 calc(100% - 22px),transparent)}
+#chat{overflow-y:auto;overflow-x:hidden;-webkit-mask-image:linear-gradient(transparent,#000 14px,#000 calc(100% - 22px),transparent);mask-image:linear-gradient(transparent,#000 14px,#000 calc(100% - 22px),transparent)}
 .thread{padding:18px 0 30px}
 .empty{padding-top:8vh;animation:rise .5s ease both}
 .empty .mark{width:64px;height:64px;margin-bottom:18px}
@@ -917,7 +918,8 @@ body.noside .lead .mark{display:grid}
 .stack.editing{width:100%;max-width:100%}
 .bubble{background:var(--user);padding:9px 15px;border-radius:18px 18px 4px 18px;max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere}
 .main{flex:1;min-width:0}
-.body{overflow-wrap:anywhere}
+.body{overflow-wrap:anywhere;word-break:break-word}
+.body img,.body table{max-width:100%}
 .body p{margin:0 0 .75em}
 .body>:last-child{margin-bottom:0}
 .body ul,.body ol{margin:.2em 0 .75em;padding-left:1.3em}
@@ -937,10 +939,11 @@ body.noside .lead .mark{display:grid}
 .src:empty{display:none}
 .srcbtn{display:inline-flex;align-items:center;gap:10px;background:var(--panel);border:0;border-radius:999px;padding:5px 14px 5px 6px;color:var(--muted);font-size:13px;box-shadow:inset 0 0 0 1px var(--line);cursor:pointer;transition:background .15s,color .15s}
 .srcbtn:hover,.src.open .srcbtn{background:var(--raised);color:var(--text)}
-.stack{display:inline-flex}
+.favs{display:inline-flex}
 .fav{width:20px;height:20px;border-radius:50%;background:#fff;object-fit:cover;flex:none;display:inline-grid;place-items:center;font:600 11px/1 var(--sans);color:var(--ink);box-shadow:0 0 0 2px var(--panel)}
-.stack .fav+.fav{margin-left:-7px}
-.srclist{display:none;list-style:none;margin:8px 0 0;padding:0}
+.favs .fav+.fav{margin-left:-7px}
+.srclist{display:none;list-style:none;margin:8px 0 0;padding:0;grid-template-columns:minmax(0,1fr)}
+.srclist li{min-width:0}
 .src.open .srclist{display:grid;gap:2px}
 .srclist a{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:10px;color:var(--text);text-decoration:none}
 .srclist a:hover{background:var(--panel)}
@@ -1022,6 +1025,30 @@ li.none{padding:22px 0}
   .conv:not(.active) .cacts{display:none}
 }
 @media(max-width:520px){.pill span{display:none}}
+@media(max-width:640px){
+  body{font-size:15px;line-height:1.55}
+  .col{width:calc(100% - 24px)}
+  .bar{padding:8px 0 6px}
+  .brand h1{font-size:20px}
+  #ttl{font-size:16px}
+  .thread{padding:10px 0 20px}
+  .msg{margin-bottom:12px}
+  .stack{max-width:92%}
+  .bubble{padding:8px 13px;border-radius:17px 17px 4px 17px}
+  .body p{margin-bottom:.6em}
+  .empty{padding-top:4vh}
+  .empty .mark{width:48px;height:48px;margin-bottom:12px}
+  .empty p{margin-bottom:18px;font-size:15.5px}
+  .chip{padding:10px 12px;font-size:14px}
+  .composer{padding:4px 0 max(10px,env(safe-area-inset-bottom))}
+  .box{padding:4px 4px 4px 16px;border-radius:24px}
+  textarea,.search input,.rename,.edit{font-size:16px}
+  .ibtn{width:36px;height:36px}
+  .tool{padding:6px}
+  .body pre{padding:10px 12px;font-size:13px}
+  .srcbtn{font-size:12.5px}
+  #drawer{width:100vw}
+}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -1203,7 +1230,7 @@ function paintSrc(el, list) {
   list = (list || []).filter(s => /^https?:\/\//.test(s.url));
   if (!list.length) { box.innerHTML = ""; return; }
   const fav = s => `<img class="fav" src="${esc(favUrl(s.domain))}" alt="" referrerpolicy="no-referrer" data-l="${esc((s.domain || "?").charAt(0).toUpperCase())}">`;
-  box.innerHTML = `<button type="button" class="srcbtn" aria-expanded="${box.classList.contains("open")}"><span class="stack">${list.slice(0, 5).map(fav).join("")}</span><span>${list.length} source${list.length > 1 ? "s" : ""}</span></button>` +
+  box.innerHTML = `<button type="button" class="srcbtn" aria-expanded="${box.classList.contains("open")}"><span class="favs">${list.slice(0, 5).map(fav).join("")}</span><span>${list.length} source${list.length > 1 ? "s" : ""}</span></button>` +
     `<ul class="srclist">${list.map(s => `<li><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${fav(s)}<span class="st"><b>${esc(s.title || s.domain)}</b><i>${esc(s.domain)}</i></span></a></li>`).join("")}</ul>`;
   box.querySelectorAll("img.fav").forEach(i => { i.onerror = () => { const sp = document.createElement("span"); sp.className = "fav"; sp.textContent = i.dataset.l; i.replaceWith(sp); }; });
   const btn = box.querySelector(".srcbtn");
