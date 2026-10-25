@@ -9,7 +9,11 @@ import sqlite3
 import ssl
 import threading
 import time
+import urllib.error
 import urllib.request
+import html as htmllib
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
@@ -320,7 +324,7 @@ def _history(conn, conv):
             pending = r["text"]
         else:
             if pending is not None and not r["error"] and r["text"].strip():
-                turns += [Turn(role="user", text=pending), Turn(role="assistant", text=r["text"])]
+                turns += [Turn(role="user", text=pending), Turn(role="assistant", text=_strip_sources(r["text"]))]
             pending = None
     return turns[-12:]
 
@@ -419,31 +423,139 @@ def route_message(client, message, history):
     raise ZivaError(_failure_message(last))
 
 
+SRC_MARK = "<!--ziva-sources:"
+SRC_END = "-->"
+_UA = {"User-Agent": "Mozilla/5.0 (compatible; ZivaBot/1.0)"}
+_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+RULES = (
+    "You are Ziva, a warm, concise personal assistant from Africa. Light markdown is fine. "
+    "Today is {today}.\n\n"
+    "ACCURACY RULES:\n"
+    "1. For anything factual or that can change (news, people, prices, versions, laws, products, "
+    "events, statistics, anything with 'latest', 'current', 'today', 'now'), you MUST search the web "
+    "before answering. Never answer such questions from memory.\n"
+    "2. Run several different searches covering different angles and consult as many independent "
+    "sources as possible. Open the actual pages when snippets are thin. Prefer official, primary and recent sources.\n"
+    "3. State only what the retrieved sources support. If sources disagree, say so. If you could not "
+    "verify something, say so plainly instead of guessing.\n"
+    "4. Never invent URLs, quotes, figures, dates or source names. Give dates for time-sensitive facts.\n"
+    "5. Skip searching only for greetings, small talk, arithmetic, and writing or coding tasks needing no outside facts.\n"
+    "6. Do not write a sources list or link list yourself; the app displays sources automatically."
+)
+
+
+def _strip_sources(text):
+    i = text.find(SRC_MARK)
+    return text[:i].rstrip() if i >= 0 else text
+
+
+def _domain(url):
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _resolve(src):
+    url, title, domain = src["url"], src.get("title", ""), src.get("domain", "")
+    try:
+        if "vertexaisearch.cloud.google.com" in url:
+            try:
+                _opener.open(urllib.request.Request(url, headers=_UA), timeout=5).close()
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location")
+                if e.code in (301, 302, 303, 307, 308) and loc:
+                    url = loc
+        domain = _domain(url) or domain
+        with urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=4) as r:
+            if "html" in (r.headers.get("Content-Type") or ""):
+                m = _TITLE.search(r.read(60000).decode("utf-8", "ignore"))
+                if m:
+                    t = htmllib.unescape(re.sub(r"\s+", " ", m.group(1))).strip()
+                    if t:
+                        title = t[:140]
+    except Exception as e:
+        log.info("Source resolve failed for %s: %s", url[:80], e)
+    return {"url": url, "title": title or domain, "domain": domain or title}
+
+
+def _collect(chunk, found):
+    for cand in chunk.candidates or []:
+        gm = cand.grounding_metadata
+        for g in (gm.grounding_chunks if gm else None) or []:
+            if g.web and g.web.uri:
+                found.setdefault(g.web.uri, {"url": g.web.uri, "title": "", "domain": g.web.title or ""})
+        um = cand.url_context_metadata
+        for u in (um.url_metadata if um else None) or []:
+            status = str(getattr(u, "url_retrieval_status", "") or "SUCCESS")
+            if u.retrieved_url and "SUCCESS" in status:
+                found.setdefault(u.retrieved_url, {"url": u.retrieved_url, "title": "", "domain": _domain(u.retrieved_url)})
+
+
+def _sources_block(found):
+    if not found:
+        return ""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        items = list(pool.map(_resolve, found.values()))
+    seen, out = set(), []
+    for it in items:
+        if not it["url"].startswith(("http://", "https://")):
+            continue
+        key = it["url"].split("#")[0].rstrip("/")
+        if key not in seen:
+            seen.add(key)
+            out.append(it)
+    if not out:
+        return ""
+    payload = json.dumps(out, ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e")
+    return f"\n\n{SRC_MARK}{payload}{SRC_END}"
+
+
 def stream_reply(client, history, message):
     contents = [types.Content(role="user" if t.role == "user" else "model", parts=[types.Part(text=t.text)]) for t in history]
     contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
-    config = types.GenerateContentConfig(system_instruction=(
-        "You are Ziva, a warm, concise personal assistant from Africa. Answer naturally and briefly. "
-        f"Light markdown is fine. Today is {datetime.now().strftime('%A, %d %B %Y')}."
-    ))
+    system = RULES.format(today=datetime.now().strftime("%A, %d %B %Y"))
+    toolsets = [
+        [types.Tool(google_search=types.GoogleSearch()), types.Tool(url_context=types.UrlContext())],
+        [types.Tool(google_search=types.GoogleSearch())],
+    ]
     last = None
     for attempt in range(2):
         for model in model_sequence(client):
-            started = False
-            try:
-                for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
-                    if chunk.text:
-                        started = True
-                        yield chunk.text
-                _state["model"] = model
-                return
-            except Exception as e:
-                log.warning("Stream model %s failed: %s", model, e)
-                if started:
-                    yield "\n\n*The reply was cut short. Send your message again.*"
+            for tools in toolsets:
+                started, found = False, {}
+                config = types.GenerateContentConfig(
+                    system_instruction=system, tools=tools, temperature=0.2,
+                    http_options=types.HttpOptions(timeout=90000),
+                )
+                try:
+                    for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+                        _collect(chunk, found)
+                        if chunk.text:
+                            started = True
+                            yield chunk.text
+                    _state["model"] = model
+                    block = _sources_block(found)
+                    if block:
+                        yield block
                     return
-                _check(e)
-                last = e
+                except Exception as e:
+                    log.warning("Stream model %s failed: %s", model, e)
+                    if started:
+                        yield "\n\n*The reply was cut short. Send your message again.*"
+                        return
+                    _check(e)
+                    last = e
+                    if getattr(e, "code", None) == 400:
+                        continue
+                    break
         if attempt == 0 and _transient(last):
             time.sleep(2)
             continue
@@ -809,6 +921,21 @@ body.noside .lead .mark{display:grid}
 .cp:hover{color:var(--text)}
 @media(hover:none){.cp{opacity:1}}
 .hint{color:var(--muted)}
+.src{margin-top:12px}
+.src:empty{display:none}
+.srcbtn{display:inline-flex;align-items:center;gap:10px;background:var(--panel);border:0;border-radius:999px;padding:5px 14px 5px 6px;color:var(--muted);font-size:13px;box-shadow:inset 0 0 0 1px var(--line);cursor:pointer;transition:background .15s,color .15s}
+.srcbtn:hover,.src.open .srcbtn{background:var(--raised);color:var(--text)}
+.stack{display:inline-flex}
+.fav{width:20px;height:20px;border-radius:50%;background:#fff;object-fit:cover;flex:none;display:inline-grid;place-items:center;font:600 11px/1 var(--sans);color:var(--ink);box-shadow:0 0 0 2px var(--panel)}
+.stack .fav+.fav{margin-left:-7px}
+.srclist{display:none;list-style:none;margin:8px 0 0;padding:0}
+.src.open .srclist{display:grid;gap:2px}
+.srclist a{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:10px;color:var(--text);text-decoration:none}
+.srclist a:hover{background:var(--panel)}
+.srclist .fav{box-shadow:none}
+.st{min-width:0;display:flex;flex-direction:column;line-height:1.35}
+.st b{font-weight:500;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st i{font-style:normal;font-size:12px;color:var(--muted)}
 .msg.error .body{color:#F3B8A3;border-left:2px solid var(--copper);padding-left:12px}
 .streaming .body>:last-child::after{content:"";display:inline-block;width:8px;height:8px;margin-left:6px;border-radius:50%;background:var(--gold);animation:beat 1s ease-in-out infinite}
 @keyframes beat{50%{transform:scale(.45);opacity:.5}}
@@ -1038,11 +1165,37 @@ function shell(role) {
   el.className = "msg " + role;
   el.innerHTML = role === "user"
     ? '<div class="stack"><div class="bubble"></div><div class="tools"></div></div>'
-    : '<div class="main"><div class="body"></div><div class="tools"></div></div>';
+    : '<div class="main"><div class="body"></div><div class="src"></div><div class="tools"></div></div>';
   return el;
 }
 function paintBody(el, m) {
   el.querySelector(".body").innerHTML = m.text ? render(m.text) : m.stopped ? '<p class="hint">Stopped before a reply.</p>' : "";
+  paintSrc(el, m.sources);
+}
+const SRC = "<!--ziva-sources:";
+function splitSrc(t) {
+  t = t || "";
+  const i = t.indexOf(SRC);
+  if (i >= 0) {
+    let s = [];
+    try { s = JSON.parse(t.slice(i + SRC.length).replace(/-->\s*$/, "")); } catch (e) {}
+    return [t.slice(0, i).trimEnd(), s];
+  }
+  for (let k = SRC.length - 1; k > 0; k--) if (t.endsWith(SRC.slice(0, k))) return [t.slice(0, -k), []];
+  return [t, []];
+}
+const favUrl = d => "https://www.google.com/s2/favicons?sz=64&domain=" + encodeURIComponent(d || "");
+function paintSrc(el, list) {
+  const box = el.querySelector(".src");
+  if (!box) return;
+  list = (list || []).filter(s => /^https?:\/\//.test(s.url));
+  if (!list.length) { box.innerHTML = ""; return; }
+  const fav = s => `<img class="fav" src="${esc(favUrl(s.domain))}" alt="" referrerpolicy="no-referrer" data-l="${esc((s.domain || "?").charAt(0).toUpperCase())}">`;
+  box.innerHTML = `<button type="button" class="srcbtn" aria-expanded="${box.classList.contains("open")}"><span class="stack">${list.slice(0, 5).map(fav).join("")}</span><span>${list.length} source${list.length > 1 ? "s" : ""}</span></button>` +
+    `<ul class="srclist">${list.map(s => `<li><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${fav(s)}<span class="st"><b>${esc(s.title || s.domain)}</b><i>${esc(s.domain)}</i></span></a></li>`).join("")}</ul>`;
+  box.querySelectorAll("img.fav").forEach(i => { i.onerror = () => { const sp = document.createElement("span"); sp.className = "fav"; sp.textContent = i.dataset.l; i.replaceWith(sp); }; });
+  const btn = box.querySelector(".srcbtn");
+  btn.onclick = () => btn.setAttribute("aria-expanded", box.classList.toggle("open"));
 }
 function toolBtn(icon, title, fn) {
   const b = document.createElement("button");
@@ -1218,7 +1371,9 @@ async function send(text, replaceFrom, retry) {
         if (!started) { started = true; stopThink(); el.classList.add("streaming"); }
         full += dec.decode(value, { stream: true });
         const stick = nearBottom();
-        body.innerHTML = render(full);
+        const [shown, found] = splitSrc(full);
+        body.innerHTML = render(shown);
+        if (found.length) paintSrc(el, found);
         if (stick) toBottom();
       }
       full += dec.decode();
@@ -1230,13 +1385,14 @@ async function send(text, replaceFrom, retry) {
   stopThink();
   ctl = null;
   if (convId !== my) { setBusy(false); return; }
-  Object.assign(am, { text: full, pending: false, error: failed, stopped: aborted });
+  const [clean, found] = splitSrc(full);
+  Object.assign(am, { text: clean, sources: found, pending: false, error: failed, stopped: aborted });
   el.classList.remove("streaming");
   el.classList.toggle("error", failed);
   paintBody(el, am);
   if (!um.id) await fixIds(my, um);
   if (convId !== my) { setBusy(false); return; }
-  if (!failed && !aborted) speak(full);
+  if (!failed && !aborted) speak(am.text);
   setBusy(false);
   fillAll();
   loadConvs();
@@ -1388,7 +1544,7 @@ async function openConv(id) {
     d = await r.json();
   } catch (e) { return false; }
   convId = d.id;
-  msgs = d.messages.map(m => ({ ...m, error: !!m.error, stopped: !!m.stopped }));
+  msgs = d.messages.map(m => { const [t, s] = splitSrc(m.text); return { ...m, text: t, sources: s, error: !!m.error, stopped: !!m.stopped }; });
   if (msgs.length && msgs[msgs.length - 1].role === "user") msgs.push({ id: null, role: "assistant", text: "", stopped: true });
   titleEl.textContent = d.title;
   rememberConv();
