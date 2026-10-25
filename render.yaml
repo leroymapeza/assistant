@@ -9,6 +9,8 @@ services:
     envVars:
       - key: GOOGLE_API_KEY
         sync: false
+      - key: TAVILY_API_KEY
+        sync: false
       - key: ZIVA_DEMO
         value: "1"
       - key: ZIVA_DAILY

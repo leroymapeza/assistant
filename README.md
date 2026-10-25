@@ -19,6 +19,8 @@ Open http://127.0.0.1:8000. The key can also come from the `GOOGLE_API_KEY` envi
 | `llm_router` | `true` to route notes and reminders with a model instead of local rules |
 | `models` | Override the Gemini model order |
 | `doh` | `true` to resolve DNS over HTTPS |
+| `tavily_api_key` | Key for Tavily web search (free tier). Also read from the `TAVILY_API_KEY` environment variable. Without it, Ziva falls back to keyless DuckDuckGo search |
+| `web_search` | `false` to turn web search off |
 
 ## Public demo
 
@@ -35,4 +37,4 @@ Set `ZIVA_DEMO=1` to run it safely in public. Each visitor gets a private worksp
 
 1. Push this repo to GitHub.
 2. In Render, choose New, then Blueprint, and select the repo. `render.yaml` does the rest.
-3. Set `GOOGLE_API_KEY` in the service's environment settings. Never commit it.
+3. Set `GOOGLE_API_KEY` and `TAVILY_API_KEY` in the service's environment settings. Never commit them.
