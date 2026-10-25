@@ -163,7 +163,12 @@ def _transient(e):
 def _failure_message(e):
     code = getattr(e, "code", None)
     if code == 429:
-        return "Gemini’s rate limit was reached. Wait a moment and try again."
+        detail = str(e)
+        if "limit: 0" in detail:
+            return "Google Search grounding has no quota on this API key (limit 0). Enable billing on the key’s Google Cloud project, or set a different model in config.json."
+        if re.search(r"PerDay|per day|daily", detail, re.I):
+            return "Gemini’s daily quota for this key is used up (search grounding is capped separately). It resets at midnight Pacific time, or enable billing for more."
+        return "Gemini’s per-minute limit was reached. Wait about a minute and try again."
     if code in (500, 502, 503, 504):
         return "Gemini is overloaded right now. Try again in a few seconds."
     if _transient(e):
@@ -547,7 +552,7 @@ def stream_reply(client, history, message):
                         yield block
                     return
                 except Exception as e:
-                    log.warning("Stream model %s failed: %s", model, e)
+                    log.warning("Stream model %s failed: %s", model, str(e)[:600])
                     if started:
                         yield "\n\n*The reply was cut short. Send your message again.*"
                         return
