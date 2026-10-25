@@ -174,7 +174,9 @@ def _failure_message(e):
         if re.search(r"PerDay|per day|daily", detail, re.I):
             return "Gemini’s daily quota for this key is used up (search grounding is capped separately). It resets at midnight Pacific time, or enable billing for more."
         wait = _retry_delay(e)
-        return f"Gemini’s per-minute limit was reached. Try again in about {int(wait) if wait else 60} seconds."
+        if wait:
+            return f"Gemini’s per-minute limit was reached. Try again in about {int(wait)} seconds."
+        return "Google says this API key’s quota is exceeded on every model. Open ai.dev/rate-limit to see which limit is full, or enable billing on the key’s project."
     if code in (500, 502, 503, 504):
         return "Gemini is overloaded right now. Try again in a few seconds."
     if _transient(e):
