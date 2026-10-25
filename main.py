@@ -156,6 +156,11 @@ def _check(e):
         _state["not_found"] = True
 
 
+def _retry_delay(e):
+    m = re.search(r"retry(?:Delay)?\D{0,12}?(\d+(?:\.\d+)?)\s*s", str(e), re.I)
+    return min(float(m.group(1)) + 1, 25) if m else 0
+
+
 def _transient(e):
     return getattr(e, "code", None) in (429, 500, 502, 503, 504) or "timed out" in str(e).lower()
 
@@ -168,7 +173,8 @@ def _failure_message(e):
             return "Google Search grounding has no quota on this API key (limit 0). Enable billing on the key’s Google Cloud project, or set a different model in config.json."
         if re.search(r"PerDay|per day|daily", detail, re.I):
             return "Gemini’s daily quota for this key is used up (search grounding is capped separately). It resets at midnight Pacific time, or enable billing for more."
-        return "Gemini’s per-minute limit was reached. Wait about a minute and try again."
+        wait = _retry_delay(e)
+        return f"Gemini’s per-minute limit was reached. Try again in about {int(wait) if wait else 60} seconds."
     if code in (500, 502, 503, 504):
         return "Gemini is overloaded right now. Try again in a few seconds."
     if _transient(e):
@@ -527,10 +533,9 @@ def stream_reply(client, history, message):
     contents = [types.Content(role="user" if t.role == "user" else "model", parts=[types.Part(text=t.text)]) for t in history]
     contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
     system = RULES.format(today=datetime.now().strftime("%A, %d %B %Y"))
-    toolsets = [
-        [types.Tool(google_search=types.GoogleSearch()), types.Tool(url_context=types.UrlContext())],
-        [types.Tool(google_search=types.GoogleSearch())],
-    ]
+    toolsets = [[types.Tool(google_search=types.GoogleSearch())]]
+    if load_config().get("read_pages"):
+        toolsets.insert(0, [types.Tool(google_search=types.GoogleSearch()), types.Tool(url_context=types.UrlContext())])
     last = None
     for attempt in range(2):
         for model in model_sequence(client):
@@ -562,7 +567,7 @@ def stream_reply(client, history, message):
                         continue
                     break
         if attempt == 0 and _transient(last):
-            time.sleep(2)
+            time.sleep(_retry_delay(last) or 2)
             continue
         break
     raise ZivaError(_failure_message(last))
