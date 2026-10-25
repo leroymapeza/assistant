@@ -83,7 +83,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "ziva.db")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
-DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]
+DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 DEMO = os.environ.get("ZIVA_DEMO", "").lower() in ("1", "true", "yes")
 HOURLY = int(os.environ.get("ZIVA_HOURLY", "20"))
 DAILY = int(os.environ.get("ZIVA_DAILY", "400"))
@@ -614,6 +614,9 @@ def _sources_block(found):
     return f"\n\n{SRC_MARK}{payload}{SRC_END}"
 
 
+NO_SEARCH_NOTE = "*Web search is unavailable right now, so this answer comes from my built-in knowledge and may be out of date.*\n\n"
+
+
 def stream_reply(client, history, message, files=()):
     contents = [types.Content(role="user" if t.role == "user" else "model", parts=_file_parts(t.files) + [types.Part(text=t.text)]) for t in history]
     contents.append(types.Content(role="user", parts=_file_parts(files) + [types.Part(text=message)]))
@@ -622,39 +625,48 @@ def stream_reply(client, history, message, files=()):
     if load_config().get("read_pages"):
         toolsets.insert(0, [types.Tool(google_search=types.GoogleSearch()), types.Tool(url_context=types.UrlContext())])
     last = None
-    for attempt in range(2):
-        for model in model_sequence(client):
-            for tools in toolsets:
-                started, found = False, {}
-                config = types.GenerateContentConfig(
-                    system_instruction=system, tools=tools, temperature=0.2,
-                    http_options=types.HttpOptions(timeout=90000),
-                )
-                try:
-                    for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
-                        _collect(chunk, found)
-                        if chunk.text:
-                            started = True
-                            yield chunk.text
-                    _state["model"] = model
-                    block = _sources_block(found)
-                    if block:
-                        yield block
-                    return
-                except Exception as e:
-                    log.warning("Stream model %s failed: %s", model, str(e)[:600])
-                    if started:
-                        yield "\n\n*The reply was cut short. Send your message again.*"
+    for grounded in (True, False):
+        options = toolsets if grounded else [None]
+        prompt = system if grounded else system + "\n\nWeb search is unavailable for this reply. Answer from general knowledge and clearly flag anything that may have changed recently."
+        for attempt in range(2):
+            for model in model_sequence(client):
+                for tools in options:
+                    started, found = False, {}
+                    config = types.GenerateContentConfig(
+                        system_instruction=prompt, tools=tools, temperature=0.2,
+                        http_options=types.HttpOptions(timeout=90000),
+                    )
+                    try:
+                        for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+                            _collect(chunk, found)
+                            if chunk.text:
+                                if not started and not grounded:
+                                    yield NO_SEARCH_NOTE
+                                started = True
+                                yield chunk.text
+                        _state["model"] = model
+                        block = _sources_block(found)
+                        if block:
+                            yield block
                         return
-                    _check(e)
-                    last = e
-                    if getattr(e, "code", None) == 400:
-                        continue
-                    break
-        if attempt == 0 and _transient(last) and (getattr(last, "code", None) != 429 or _retry_delay(last)):
-            time.sleep(_retry_delay(last) or 2)
-            continue
-        break
+                    except Exception as e:
+                        log.warning("Stream model %s (%s) failed: %s", model, "search" if grounded else "no search", str(e)[:600])
+                        if started:
+                            yield "\n\n*The reply was cut short. Send your message again.*"
+                            return
+                        _check(e)
+                        last = e
+                        if getattr(e, "code", None) == 400:
+                            continue
+                        break
+            if attempt == 0 and _transient(last) and (getattr(last, "code", None) != 429 or _retry_delay(last)):
+                time.sleep(_retry_delay(last) or 2)
+                continue
+            break
+        if getattr(last, "code", None) != 429:
+            break
+        if grounded:
+            log.warning("Search grounding returned 429 on every model; retrying without search")
     raise ZivaError(_failure_message(last))
 
 
