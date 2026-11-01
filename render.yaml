@@ -11,6 +11,10 @@ services:
         sync: false
       - key: TAVILY_API_KEY
         sync: false
+      - key: CF_ACCOUNT_ID
+        sync: false
+      - key: CF_API_TOKEN
+        sync: false
       - key: ZIVA_DEMO
         value: "1"
       - key: ZIVA_DAILY

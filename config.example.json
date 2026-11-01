@@ -1,4 +1,8 @@
 {
   "google_api_key": "PASTE_YOUR_KEY_HERE",
-  "tavily_api_key": "PASTE_YOUR_KEY_HERE"
+  "tavily_api_key": "PASTE_YOUR_KEY_HERE",
+  "cloudflare": {
+    "account_id": "PASTE_YOUR_ACCOUNT_ID_HERE",
+    "api_token": "PASTE_YOUR_TOKEN_HERE"
+  }
 }

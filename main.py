@@ -126,6 +126,25 @@ def get_client():
     return _make_client(key)
 
 
+LLAMA_ID = "@cf/meta/llama-3.2-3b-instruct"
+
+
+def cf_config():
+    cfg = load_config().get("cloudflare") or {}
+    acct = os.environ.get("CF_ACCOUNT_ID") or cfg.get("account_id", "")
+    token = os.environ.get("CF_API_TOKEN") or cfg.get("api_token", "")
+    if not acct or not token or "PASTE" in acct + token:
+        return None
+    return {
+        "base_url": f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1",
+        "api_key": token,
+        "model": cfg.get("model", LLAMA_ID),
+        "timeout": cfg.get("timeout", 60),
+        "temperature": 0.2,
+        "max_tokens": cfg.get("max_tokens", 1024),
+    }
+
+
 def _discover(client):
     try:
         names = [
@@ -310,6 +329,7 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
     replace_from: int | None = None
     retry: bool = False
+    model: str = ""
 
 
 class Rename(BaseModel):
@@ -563,6 +583,7 @@ FILES = (
     "- .pptx: each # or ## heading is one slide. A first # slide followed by at least one more slide becomes the title slide, with plain lines under it as the subtitle. "
     "Use short - bullets (at most 6 per slide, indent two spaces for sub-points), tables if useful, and lines starting with > for speaker notes.\n"
 )
+FILES_LITE = FILES[:FILES.index("9. ")]
 RULES = STYLE + GROUND + FILES
 RAG_RULES = STYLE + RAG + FILES
 
@@ -695,7 +716,7 @@ def _page_text(url):
     return " ".join(p for p in paras if len(p) > 60)[:3500]
 
 
-def _web_research(history, message, has_files):
+def _web_research(history, message, has_files, keep=None):
     cfg = load_config()
     if cfg.get("web_search") is False or _skip_search(message, has_files):
         return "skip"
@@ -718,6 +739,8 @@ def _web_research(history, message, has_files):
         if k not in seen and r["url"].startswith(("http://", "https://")):
             seen.add(k)
             uniq.append(r)
+    if keep:
+        uniq = uniq[:keep]
     if not uniq:
         return None
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -826,18 +849,15 @@ def route_rules(message):
     return "chat", message
 
 
-def stream_openai(cfg, history, message):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += [{"role": t.role, "content": t.text} for t in history]
-    messages.append({"role": "user", "content": message})
-    headers = {"Content-Type": "application/json"}
+def _sse_chat(cfg, messages):
+    headers = {"Content-Type": "application/json", "User-Agent": "Ziva/1.0"}
     if cfg.get("api_key"):
         headers["Authorization"] = "Bearer " + cfg["api_key"]
-    req = urllib.request.Request(
-        cfg["base_url"].rstrip("/") + "/chat/completions",
-        data=json.dumps({"model": cfg.get("model", "local"), "messages": messages, "stream": True}).encode(),
-        headers=headers,
-    )
+    body = {"model": cfg.get("model", "local"), "messages": messages, "stream": True}
+    for key in ("temperature", "max_tokens"):
+        if key in cfg:
+            body[key] = cfg[key]
+    req = urllib.request.Request(cfg["base_url"].rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=cfg.get("timeout", 120)) as resp:
         for raw in resp:
             line = raw.decode("utf-8").strip()
@@ -846,10 +866,90 @@ def stream_openai(cfg, history, message):
             data = line[5:].strip()
             if data == "[DONE]":
                 return
-            choices = json.loads(data).get("choices") or [{}]
-            piece = choices[0].get("delta", {}).get("content")
+            try:
+                choices = json.loads(data).get("choices") or [{}]
+            except ValueError:
+                continue
+            piece = (choices[0].get("delta") or {}).get("content")
             if piece:
                 yield piece
+
+
+def stream_openai(cfg, history, message):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += [{"role": t.role, "content": t.text} for t in history]
+    messages.append({"role": "user", "content": message})
+    yield from _sse_chat(cfg, messages)
+
+
+_NO_VISION = ("image", "audio", "video")
+
+
+def _plain_files(files):
+    out = []
+    for name, mime, raw in files:
+        binary = (mime.split("/")[0] in _NO_VISION and "svg" not in mime) or mime == "application/pdf"
+        text = None if binary else _file_text(name, mime, raw)
+        if text is None:
+            out.append(f"[Attached file “{name}” cannot be read by this model. Tell the user to switch to Gemini for images, PDFs, audio and video.]")
+        else:
+            out.append(f"[Attached file: {name}]\n```\n{text[:12000]}\n```")
+    return "\n\n".join(out)
+
+
+def _llama_failure(e):
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            detail = e.read(600).decode("utf-8", "ignore")
+        except Exception:
+            detail = ""
+        log.warning("Llama request failed: HTTP %s %s", e.code, detail[:300])
+        if e.code in (401, 403) and "1010" not in detail:
+            return "Cloudflare rejected the API token. Check CF_API_TOKEN and that it has Workers AI permission."
+        if e.code == 429 or "4006" in detail or "neurons" in detail.lower():
+            return "Llama’s free daily allowance is used up. It resets at 02:00 Harare time. Switch to Gemini or try again later."
+        return f"Llama didn’t respond (error {e.code}). Try again or switch to Gemini."
+    log.warning("Llama request failed: %s", e)
+    return "Couldn’t reach Llama. Try again or switch to Gemini."
+
+
+def llama_stream(cfg, history, message, files=()):
+    today = datetime.now().strftime("%A, %d %B %Y")
+    research = _web_research(history, message, bool(files), keep=6)
+    sources, note = None, ""
+    if research and research != "skip":
+        ctx, sources = research
+        system = (STYLE + RAG + FILES_LITE).format(today=today)
+        user = f"{ctx}\n\nUSER QUESTION:\n{message}"
+    else:
+        system = (STYLE + FILES_LITE).format(today=today)
+        user = message
+        if research is None:
+            system += "\nWeb search is unavailable for this reply. Answer from general knowledge and clearly flag anything that may have changed recently."
+            note = NO_SEARCH_NOTE
+    if files:
+        user = _plain_files(files) + "\n\n" + user
+    messages = [{"role": "system", "content": system}]
+    messages += [{"role": t.role, "content": t.text + (" [attached: " + ", ".join(f[0] for f in t.files) + "]" if t.files else "")} for t in history[-8:]]
+    messages.append({"role": "user", "content": user})
+    started = False
+    try:
+        for piece in _sse_chat(cfg, messages):
+            if not started and note:
+                yield note
+            started = True
+            yield piece
+    except Exception as e:
+        if started:
+            log.warning("Llama stream cut short: %s", e)
+            yield "\n\n*The reply was cut short. Send your message again.*"
+            return
+        raise ZivaError(_llama_failure(e))
+    if not started:
+        raise ZivaError("Llama returned an empty reply. Try again or switch to Gemini.")
+    block = _marker(sources)
+    if block:
+        yield block
 
 
 def reply_stream(client, history, message, files=()):
@@ -886,13 +986,18 @@ def home():
     return HTML_PAGE
 
 
-def _produce(message, history, files=()):
+def _produce(message, history, files=(), model=""):
     command = COMMANDS.get(message.lower())
     if command:
         return "text", command(), False, False
     cfg = load_config()
+    llama = None
+    if model == "llama":
+        llama = cf_config()
+        if not llama:
+            return "text", "Llama isn’t set up on this server. Add the Cloudflare keys, or switch to Gemini.", True, False
     client = get_client()
-    if not client and not cfg.get("openai_compat"):
+    if not client and not cfg.get("openai_compat") and not llama:
         return "text", "No API key found. Add your Google API key to config.json (google_api_key) or set GOOGLE_API_KEY.", True, False
     try:
         action, content = route_message(client, message, history) if client and cfg.get("llm_router") else route_rules(message)
@@ -907,7 +1012,7 @@ def _produce(message, history, files=()):
             return "text", list_notes(), False, False
         if action == "list_reminders":
             return "text", list_reminders(), False, False
-        stream = reply_stream(client, history, message, files)
+        stream = llama_stream(llama, history, message, files) if llama else reply_stream(client, history, message, files)
         return "stream", stream, next(stream)
     except StopIteration:
         return "text", "I didn’t get an answer back. Try rephrasing that.", True, False
@@ -941,7 +1046,7 @@ def _start_turn(req, blocked=None):
         if files and not blocked:
             conn.executemany("INSERT INTO attachments (message_id, name, mime, data) VALUES (?, ?, ?, ?)", [(user_id, n, m, d) for n, m, d in files])
         conn.execute("UPDATE conversations SET title = ? WHERE id = ? AND title = ?", (_title_from(message), conv, DEFAULT_TITLE))
-    return conv, user_id, ("text", blocked, True, False) if blocked else _produce(message, history, files)
+    return conv, user_id, ("text", blocked, True, False) if blocked else _produce(message, history, files, req.model)
 
 
 def _save_assistant(conv, text, error=False):
@@ -1587,7 +1692,7 @@ async def export_file(req: ExportRequest):
 
 @app.get("/api/config")
 def public_config():
-    return {"demo": DEMO, "hourly": HOURLY, "ttl": TTL_HOURS, "max_mb": MAX_FILE // 1048576, "max_files": MAX_FILES}
+    return {"llama": bool(cf_config()), "demo": DEMO, "hourly": HOURLY, "ttl": TTL_HOURS, "max_mb": MAX_FILE // 1048576, "max_files": MAX_FILES}
 
 
 @app.get("/api/conversations")
@@ -1735,6 +1840,10 @@ body.noside .lead .mark{display:grid}
 .acts{display:flex;align-items:center;gap:2px;flex:none}
 .pill{display:flex;align-items:center;gap:8px;background:none;border:0;border-radius:999px;padding:8px 12px;font-size:14px;color:var(--muted);transition:background .15s,color .15s}
 .pill:hover{background:var(--panel);color:var(--text)}
+.msel{appearance:none;-webkit-appearance:none;background:var(--panel);border:0;border-radius:999px;padding:7px 28px 7px 12px;margin-right:6px;font:inherit;font-size:13.5px;color:var(--text);box-shadow:inset 0 0 0 1px var(--line);cursor:pointer;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 15px) 52%,calc(100% - 10px) 52%;background-size:5px 5px;background-repeat:no-repeat}
+.msel:hover{background-color:var(--raised)}
+.msel[hidden]{display:none}
+.msel option{background:var(--panel);color:var(--text)}
 #badge{background:var(--gold);color:var(--ink);border-radius:999px;font-size:11px;font-weight:600;min-width:18px;height:18px;padding:0 5px;display:grid;place-items:center}
 #chat{overflow-y:auto;overflow-x:hidden;-webkit-mask-image:linear-gradient(transparent,#000 14px,#000 calc(100% - 22px),transparent);mask-image:linear-gradient(transparent,#000 14px,#000 calc(100% - 22px),transparent)}
 .thread{padding:18px 0 30px}
@@ -1901,7 +2010,8 @@ li.none{padding:22px 0}
   .chip{padding:10px 12px;font-size:14px}
   .composer{padding:4px 0 max(10px,env(safe-area-inset-bottom))}
   .box{padding:4px 4px 4px 6px;border-radius:24px}
-  textarea,.search input,.rename,.edit{font-size:16px}
+  textarea,.search input,.rename,.edit,.msel{font-size:16px}
+  .msel{padding:4px 22px 4px 10px;max-width:120px;margin-right:2px;background-position:calc(100% - 12px) 52%,calc(100% - 7px) 52%}
   .ibtn{width:36px;height:36px}
   .tool{padding:6px}
   .body pre{padding:10px 12px;font-size:13px}
@@ -1932,6 +2042,7 @@ li.none{padding:22px 0}
         <h2 id="ttl">New chat</h2>
       </div>
       <div class="acts">
+        <select id="model" class="msel" aria-label="Model" title="Model" hidden><option value="gemini">Gemini</option><option value="llama">Llama (light)</option></select>
         <button id="exportBtn" class="ibtn" type="button" aria-label="Download chat" title="Download chat" data-ic="download" disabled></button>
         <button id="open" class="pill" type="button" aria-controls="drawer" aria-expanded="false"><i data-ic="list" style="display:contents"></i><span>Notes &amp; reminders</span><b id="badge" hidden>0</b></button>
       </div>
@@ -1963,6 +2074,9 @@ li.none{padding:22px 0}
 </aside>
 <script>
 const $ = s => document.querySelector(s);
+const modelSel = $("#model");
+const getModel = () => (modelSel.hidden ? "gemini" : modelSel.value);
+modelSel.addEventListener("change", () => { try { localStorage.setItem("ziva.model", modelSel.value); } catch (e) {} });
 const chat = $("#chat"), thread = $("#thread"), form = $("#form"), input = $("#input"), sendBtn = $("#send"), mic = $("#mic"), speakBtn = $("#speak");
 const drawer = $("#drawer"), scrim = $("#scrim"), openBtn = $("#open"), badge = $("#badge"), list = $("#list");
 const convsEl = $("#convs"), qEl = $("#q"), titleEl = $("#ttl"), exportBtn = $("#exportBtn"), jump = $("#jump");
@@ -2371,7 +2485,7 @@ async function send(text, replaceFrom, retry) {
   ctl = new AbortController();
   let full = "", failed = false, aborted = false;
   try {
-    const res = await fetch("/chat", { method: "POST", signal: ctl.signal, headers: JSON_H, body: JSON.stringify({ message: text, conversation_id: my, replace_from: replaceFrom || null, retry: !!retry, files: sent.map(({ name, mime, data }) => ({ name, mime, data })) }) });
+    const res = await fetch("/chat", { method: "POST", signal: ctl.signal, headers: JSON_H, body: JSON.stringify({ message: text, conversation_id: my, replace_from: replaceFrom || null, retry: !!retry, model: getModel(), files: sent.map(({ name, mime, data }) => ({ name, mime, data })) }) });
     if (!res.ok) throw new Error("Server returned " + res.status);
     loadConvs();
     if ((res.headers.get("content-type") || "").includes("application/json")) {
@@ -2646,6 +2760,10 @@ document.addEventListener("keydown", e => {
 
 fetch("/api/config").then(r => r.json()).then(c => {
   maxMB = c.max_mb || maxMB; maxFiles = c.max_files || maxFiles;
+  if (c.llama) {
+    modelSel.hidden = false;
+    try { const m = localStorage.getItem("ziva.model"); if (m === "llama" || m === "gemini") modelSel.value = m; } catch (e) {}
+  }
   if (!c.demo) return;
   const f = $("#sfoot");
   f.textContent = `Public demo. Your chats stay private to this browser, are deleted after ${c.ttl} hours, and are limited to ${c.hourly} messages an hour.`;
