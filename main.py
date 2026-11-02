@@ -875,6 +875,21 @@ def _sse_chat(cfg, messages):
                 yield piece
 
 
+def _chat_once(cfg, messages):
+    headers = {"Content-Type": "application/json", "User-Agent": "Ziva/1.0"}
+    if cfg.get("api_key"):
+        headers["Authorization"] = "Bearer " + cfg["api_key"]
+    body = {"model": cfg.get("model", "local"), "messages": messages, "stream": False}
+    for key in ("temperature", "max_tokens"):
+        if key in cfg:
+            body[key] = cfg[key]
+    req = urllib.request.Request(cfg["base_url"].rstrip("/") + "/chat/completions", data=json.dumps(body).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=cfg.get("timeout", 120)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    choice = (data.get("choices") or [{}])[0]
+    return (choice.get("message") or {}).get("content") or "", choice.get("finish_reason"), data.get("usage") or {}
+
+
 def stream_openai(cfg, history, message):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += [{"role": t.role, "content": t.text} for t in history]
@@ -932,21 +947,20 @@ def llama_stream(cfg, history, message, files=()):
     messages = [{"role": "system", "content": system}]
     messages += [{"role": t.role, "content": t.text + (" [attached: " + ", ".join(f[0] for f in t.files) + "]" if t.files else "")} for t in history[-8:]]
     messages.append({"role": "user", "content": user})
-    started = False
     try:
-        for piece in _sse_chat(cfg, messages):
-            if not started and note:
-                yield note
-            started = True
-            yield piece
+        text, reason, usage = _chat_once(cfg, messages)
+        if not text.strip() or reason not in ("stop", "length"):
+            text, reason, usage = _chat_once(cfg, messages)
     except Exception as e:
-        if started:
-            log.warning("Llama stream cut short: %s", e)
-            yield "\n\n*The reply was cut short. Send your message again.*"
-            return
         raise ZivaError(_llama_failure(e))
-    if not started:
+    log.info("Llama reply: finish=%s completion_tokens=%s chars=%d", reason, usage.get("completion_tokens"), len(text))
+    if not text.strip():
         raise ZivaError("Llama returned an empty reply. Try again or switch to Gemini.")
+    if reason == "length":
+        text += "\n\n*This reply hit the length limit. Ask me to continue.*"
+    if note:
+        yield note
+    yield text
     block = _marker(sources)
     if block:
         yield block
